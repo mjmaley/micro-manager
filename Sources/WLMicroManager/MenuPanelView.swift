@@ -5,6 +5,7 @@ import WLKit
 
 struct MenuPanelView: View {
     @EnvironmentObject var bridge: BridgeController
+    @ObservedObject private var notifications = AgentNotificationController.shared
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var inspectorError: String?
 
@@ -17,6 +18,10 @@ struct MenuPanelView: View {
                 permissionBanner
             } else if bridge.isRunning {
                 padSection
+                if bridge.deviceConnected && !bridge.isHerdrLayerActive {
+                    Divider()
+                    layerHint
+                }
                 Divider()
                 agentSection
             } else {
@@ -35,8 +40,10 @@ struct MenuPanelView: View {
             if bridge.contendingClient {
                 Divider()
                 Label(
-                    "Another app is also driving this pad — colours may fight.",
-                    systemImage: "exclamationmark.triangle"
+                    bridge.padConfiguration.isCodexMicro
+                        ? "Codex is sharing the pad; Herdr owns Layer \(bridge.herdrLayerNumber)."
+                        : "Another app is also driving this pad — colours may fight.",
+                    systemImage: bridge.padConfiguration.isCodexMicro ? "rectangle.2.swap" : "exclamationmark.triangle"
                 )
                 .font(.caption)
                 .foregroundStyle(.orange)
@@ -48,6 +55,7 @@ struct MenuPanelView: View {
             footer
         }
         .frame(width: 300)
+        .task { await notifications.refreshPermission() }
     }
 
     // MARK: - Header
@@ -81,6 +89,7 @@ struct MenuPanelView: View {
         guard bridge.deviceConnected else { return "Looking for the pad…" }
         var parts = [bridge.deviceName, bridge.firmware]
         if let battery = bridge.battery { parts.append(battery) }
+        if let layer = bridge.activeLayerNumber { parts.append("Layer \(layer)") }
         return parts.joined(separator: " · ")
     }
 
@@ -88,7 +97,7 @@ struct MenuPanelView: View {
 
     private var padSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            ForEach(Array(Pad.displayRows.enumerated()), id: \.offset) { _, row in
+            ForEach(Array(bridge.padConfiguration.displayRows.enumerated()), id: \.offset) { _, row in
                 HStack(spacing: 6) {
                     ForEach(row, id: \.self) { key in keyView(key) }
                     Spacer(minLength: 0)
@@ -101,27 +110,28 @@ struct MenuPanelView: View {
     private func keyView(_ index: Int) -> some View {
         let color = bridge.keyColors[index]
         let isBound = Pad.boundKeyIDs.contains(index)
-        let isStackKey = index == Pad.stackKeyID
-        let isTabCycleKey = index == Pad.tabCycleKeyID
-        let isLandKey = index == Pad.landKeyID
+        let isFastKey = index == Pad.fastKeyID
+        let isApproveKey = index == Pad.approveKeyID
+        let isRejectKey = index == Pad.rejectKeyID
+        let isSplitKey = index == Pad.splitKeyID
+        let isPiControl = isFastKey || isApproveKey || isRejectKey || isSplitKey
         let macroText = bridge.keyBindings.text(for: index)
         let isVoiceKey = macroText == nil && Pad.voiceKeyIDs.contains(index)
-        // Key index and agent slot are different orderings — the top row is
-        // wired right to left — so the slot lookup goes through the pad map.
-        let slot = Pad.agentSlot(for: index)
-        let agent = slot.flatMap { $0 < bridge.agents.count ? bridge.agents[$0] : nil }
+        let isSubmitKey = macroText == nil && index == Pad.submitKeyID
+        // Key index and agent slot differ on Creator Micro 2 but align on
+        // Codex Micro, so the lookup goes through the detected configuration.
+        let slot = bridge.padConfiguration.agentSlot(for: index)
+        let agent = slot.flatMap { $0 < bridge.visibleAgents.count ? bridge.visibleAgents[$0] : nil }
 
         return Button {
-            if isStackKey {
-                StackPanelController.shared.toggle()
-            } else if isTabCycleKey {
-                Task { await bridge.cycleTabs() }
-            } else if isLandKey {
-                LandPanelController.shared.handleLandKey()
+            if isPiControl {
+                bridge.handleKeyPress(index)
             } else if let macroText {
                 Task { await bridge.injectPrompt(macroText) }
             } else if isVoiceKey {
                 VoiceController.shared.handleVoiceKey()
+            } else if isSubmitKey {
+                Task { await bridge.submitFocusedPane() }
             } else if let slot, agent != nil {
                 Task { await bridge.focusSlot(slot) }
             }
@@ -135,27 +145,32 @@ struct MenuPanelView: View {
                 )
         }
         .buttonStyle(.plain)
-        .disabled(agent == nil && !isStackKey && !isTabCycleKey && !isLandKey
-                  && macroText == nil && !isVoiceKey)
-        .help(helpText(index, agent: agent, isStackKey: isStackKey,
-                       isTabCycleKey: isTabCycleKey, isLandKey: isLandKey,
-                       macroText: macroText, isVoiceKey: isVoiceKey))
+        .disabled(agent == nil && !isPiControl
+                  && macroText == nil && !isVoiceKey && !isSubmitKey)
+        .help(helpText(index, agent: agent, isFastKey: isFastKey,
+                       isApproveKey: isApproveKey, isRejectKey: isRejectKey,
+                       isSplitKey: isSplitKey, macroText: macroText,
+                       isVoiceKey: isVoiceKey, isSubmitKey: isSubmitKey))
     }
 
     private func helpText(
         _ index: Int,
         agent: HerdrAgent?,
-        isStackKey: Bool,
-        isTabCycleKey: Bool,
-        isLandKey: Bool,
+        isFastKey: Bool,
+        isApproveKey: Bool,
+        isRejectKey: Bool,
+        isSplitKey: Bool,
         macroText: String?,
-        isVoiceKey: Bool
+        isVoiceKey: Bool,
+        isSubmitKey: Bool
     ) -> String {
-        if isStackKey { return "GitButler stack for the focused agent" }
-        if isTabCycleKey { return "Cycle tabs in the focused Herdr window" }
-        if isLandKey { return "Land the focused agent's branches onto the target" }
+        if isFastKey { return "Guardrails: allow the pending command for this session" }
+        if isApproveKey { return "Approve the active Pi prompt" }
+        if isRejectKey { return "Deny the active Pi prompt" }
+        if isSplitKey { return "Fork the focused Pi session" }
         if let macroText { return "Type: \(macroText)" }
-        if isVoiceKey { return "Right command — start or stop Superwhisper" }
+        if isVoiceKey { return "Command+/ — start or stop OpenWhispr" }
+        if isSubmitKey { return "Submit — send Enter to the focused Herdr pane" }
         if let agent { return "\(agent.shortName) — \(agent.status)" }
         return "Key \(index)"
     }
@@ -170,13 +185,25 @@ struct MenuPanelView: View {
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 14).padding(.vertical, 10)
             } else {
-                ForEach(Array(bridge.agents.prefix(Pad.agentKeyIDs.count).enumerated()), id: \.offset) { index, agent in
+                if let page = bridge.agentPageLabel, bridge.agentPageCount > 1 {
+                    HStack {
+                        Text("Agents \(page)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text("Joystick ←/→ to page")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(.horizontal, 14).padding(.top, 6)
+                }
+                ForEach(Array(bridge.visibleAgents.enumerated()), id: \.offset) { index, agent in
                     Button {
                         Task { await bridge.focusSlot(index) }
                     } label: {
                         HStack(spacing: 9) {
                             Circle()
-                                .fill(bridge.keyColors[Pad.agentKeyIDs[index]] ?? Color.secondary.opacity(0.3))
+                                .fill(bridge.keyColors[bridge.padConfiguration.agentKeyIDs[index]] ?? Color.secondary.opacity(0.3))
                                 .frame(width: 9, height: 9)
                             Text("\(index)")
                                 .font(.system(.caption, design: .monospaced))
@@ -191,6 +218,12 @@ struct MenuPanelView: View {
                         .padding(.horizontal, 14).padding(.vertical, 5)
                     }
                     .buttonStyle(.plain)
+                    .contextMenu {
+                        Button("Test notification for this agent (5s)") {
+                            Task { await notifications.sendTest(paneID: agent.paneID) }
+                        }
+                        .disabled(!notifications.enabled || agent.paneID == nil)
+                    }
                 }
                 .padding(.vertical, 4)
             }
@@ -198,6 +231,17 @@ struct MenuPanelView: View {
     }
 
     // MARK: - Other states
+
+    private var layerHint: some View {
+        Label(
+            "Switch to Layer \(bridge.herdrLayerNumber) for Herdr controls and live lighting.",
+            systemImage: "square.stack.3d.up"
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(.horizontal, 14).padding(.vertical, 8)
+    }
 
     private var permissionBanner: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -227,6 +271,27 @@ struct MenuPanelView: View {
 
     private var footer: some View {
         VStack(alignment: .leading, spacing: 0) {
+            Toggle("Agent notifications", isOn: Binding(
+                get: { notifications.enabled },
+                set: { on in Task { await notifications.setEnabled(on) } }
+            ))
+            .toggleStyle(.checkbox)
+            .padding(.horizontal, 14).padding(.top, 8)
+            Text(notifications.status)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 14).padding(.top, 3)
+            HStack {
+                Button("Test notification (5s)") {
+                    Task { await notifications.sendTest() }
+                }
+                .disabled(!notifications.enabled)
+                Button("Settings…") { notifications.openSettings() }
+            }
+            .font(.caption)
+            .padding(.horizontal, 14).padding(.vertical, 5)
+
             Toggle("Open at login", isOn: $launchAtLogin)
                 .toggleStyle(.checkbox)
                 .padding(.horizontal, 14).padding(.top, 8)

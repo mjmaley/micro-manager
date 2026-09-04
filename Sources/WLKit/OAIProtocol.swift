@@ -141,6 +141,57 @@ public enum OAI {
 /// The pad's physical key rows, matching the firmware's [2, 4, 4, 3] matrix.
 /// Key index runs row-major from 0, so the six agent keys are 0...5.
 public enum Pad {
+    /// Runtime differences between the Creator Micro 2 and Codex Micro. The
+    /// matrix positions are the same, but the Creator's top row is physically
+    /// reversed and its Herdr bindings live on Layer 1. Codex Micro presents
+    /// the top row in matrix order and reserves Layer 1 for Codex, so Herdr
+    /// owns Layer 2 instead.
+    public struct Configuration: Equatable, Sendable {
+        public enum Variant: Equatable, Sendable { case creatorMicro2, codexMicro }
+
+        public var variant: Variant
+        public var agentKeyIDs: [Int]
+        public var displayRows: [[Int]]
+        /// Zero-based index into the selected profile's `layers` array.
+        public var herdrLayerIndex: Int
+
+        public var herdrLayerNumber: Int { herdrLayerIndex + 1 }
+        public var isCodexMicro: Bool { variant == .codexMicro }
+
+        public func agentSlot(for key: Int) -> Int? {
+            agentKeyIDs.firstIndex(of: key)
+        }
+
+        public func withHerdrLayer(number: Int) -> Configuration {
+            var copy = self
+            copy.herdrLayerIndex = max(0, number - 1)
+            return copy
+        }
+    }
+
+    public static let creatorMicro2 = Configuration(
+        variant: .creatorMicro2,
+        agentKeyIDs: [1, 0, 2, 3, 4, 5],
+        displayRows: [[1, 0], [2, 3, 4, 5], [6, 7, 8, 9], [10, 11, 12]],
+        herdrLayerIndex: 0
+    )
+
+    public static let codexMicro = Configuration(
+        variant: .codexMicro,
+        agentKeyIDs: [0, 1, 2, 3, 4, 5],
+        displayRows: [[0, 1], [2, 3, 4, 5], [6, 7, 8, 9], [10, 11, 12]],
+        herdrLayerIndex: 1
+    )
+
+    public static func configuration(productID: Int, product: String) -> Configuration {
+        // 0x8360 is the shipping Codex Micro observed on firmware 0.6.2. Keep
+        // the product-name fallback for later USB/Bluetooth PID variants.
+        if productID == 0x8360 || product.localizedCaseInsensitiveContains("Codex Micro") {
+            return codexMicro
+        }
+        return creatorMicro2
+    }
+
     public static let rows: [[Int]] = [
         [0, 1],
         [2, 3, 4, 5],
@@ -155,42 +206,40 @@ public enum Pad {
     /// left to right, top to bottom as you look at the pad. The firmware's top
     /// row is wired right to left — key 0 is the top-RIGHT key — so reading
     /// order starts 1, 0. The other rows run left to right in index order.
-    public static let agentKeyIDs = [1, 0, 2, 3, 4, 5]
-    /// The rows as you look at the pad, for on-screen mirrors. `rows` stays in
-    /// firmware order because the keymap file is addressed that way.
-    public static let displayRows: [[Int]] = [
-        [1, 0],
-        [2, 3, 4, 5],
-        [6, 7, 8, 9],
-        [10, 11, 12],
-    ]
+    public static let agentKeyIDs = creatorMicro2.agentKeyIDs
+    /// Default display geometry retained for Creator Micro 2 callers. The
+    /// bridge uses its detected runtime configuration instead.
+    public static let displayRows = creatorMicro2.displayRows
 
-    /// The agent slot a key answers for, or nil for non-agent keys.
+    /// The agent slot a key answers for on the default Creator Micro 2 map.
     public static func agentSlot(for key: Int) -> Int? {
-        agentKeyIDs.firstIndex(of: key)
+        creatorMicro2.agentSlot(for: key)
     }
-    /// Toggles the GitButler stack for the focused agent's directory. First key
-    /// of row 3, so the agent block above it stays whole.
-    public static let stackKeyID = 6
-    /// Cycles the tabs of the focused tab's workspace in Herdr. Second key of
-    /// row 3, next to the stack key.
-    public static let tabCycleKeyID = 7
-    /// Lands the focused agent's stack onto the target, bottom branch first.
-    /// Third key of row 3, next to the tab-cycle key.
-    public static let landKeyID = 8
+    /// Row 3 follows the labels printed on Codex Micro's FAST, APPR, REJ, and
+    /// SPLIT keycaps. FAST grants a pending Guardrails command for the session;
+    /// the next pair allow once or deny; SPLIT invokes `/fork`.
+    public static let fastKeyID = 6
+    public static let approveKeyID = 7
+    public static let rejectKeyID = 8
+    public static let splitKeyID = 9
+    // Legacy names retained for the optional GitButler panels and older callers.
+    public static let stackKeyID = fastKeyID
+    public static let tabCycleKeyID = approveKeyID
+    public static let landKeyID = rejectKeyID
     /// The wide key at the bottom left: one keycap over matrix positions 10
     /// and 11, so both are bound and lit together and a press from either
-    /// half means the same thing — a right-command tap for Superwhisper, unless
+    /// half means the same thing — OpenWhispr's Command+/ shortcut, unless
     /// the config file rebinds it to a text macro.
     public static let voiceKeyIDs = [10, 11]
-    /// Text-macro keys: inject a configured string into the focused agent's
-    /// prompt. Key 9 is the last key of row 3; key 12 is the bottom-right
-    /// corner.
-    public static let macroKeyIDs = [9, 12]
+    /// Key 12 defaults to submit/Enter but remains configurable as text.
+    public static let macroKeyIDs = [12]
+    /// Bottom-right key: submit the focused pane when it has no text override.
+    public static let submitKeyID = 12
     /// The keys bound to `KV_OAI_AG*`, and so the only ones that can be lit.
     /// With the macro and voice keys this is now the whole pad.
-    public static let boundKeyIDs =
-        agentKeyIDs + [stackKeyID, tabCycleKeyID, landKeyID] + voiceKeyIDs + macroKeyIDs
+    public static let boundKeyIDs = agentKeyIDs
+        + [fastKeyID, approveKeyID, rejectKeyID, splitKeyID]
+        + voiceKeyIDs + macroKeyIDs
 
     // MARK: Dial and joystick
 
@@ -199,6 +248,7 @@ public enum Pad {
     /// `v.oai.hid` reports. These IDs never light — nothing is under them.
     public static let dialUpID = 13     // encoder, clockwise detent
     public static let dialDownID = 14   // encoder, counter-clockwise detent
+    public static let dialClickID = 19  // encoder press; confirms a picker
     /// The joystick's four cardinal sectors, named by the angle fraction at
     /// their centre in the radial map (0 = east, counter-clockwise).
     public static let joyNorthID = 15   // sector centred on 0.25

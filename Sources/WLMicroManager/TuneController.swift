@@ -6,9 +6,8 @@ import WLKit
 /// Claude Code takes orders directly — `/effort <level>` and `/model <name>`
 /// are commands, so the dial climbs an effort ladder and the joystick cycles
 /// a model list, both configurable. Codex has bindable effort commands but
-/// only a picker for models, so its dial sends the chords bound in
-/// `[tui.keymap]` and its joystick drives the `/model` picker: north opens
-/// it, north/south move, east confirms, west cancels.
+/// only a picker for models. Pi exposes both as TUI pickers: the dial drives
+/// `/thinking` (with its click confirming), while the joystick drives `/model`.
 ///
 /// Either way the joystick is working a list you cannot see from the pad, so
 /// every deflection also puts that list on screen — see `TunePanelController`.
@@ -25,6 +24,10 @@ final class TuneController {
     var onError: ((String) -> Void)?
     /// The bridge owns the loaded config; this reads through to it.
     var bindings: () -> KeyBindings = { KeyBindings() }
+    /// Called by joystick east/right and west/left when no model picker is
+    /// active. Vertical directions and picker-confirm/cancel behavior remain
+    /// unchanged.
+    var onAgentPage: ((Int) -> Void)?
 
     /// Where each Claude pane sits on the effort ladder and model list. Blind
     /// state: it starts at the defaults and follows our own commands, so a
@@ -35,14 +38,33 @@ final class TuneController {
     /// The codex pane whose `/model` picker we opened, if any. Deflections
     /// steer the picker only while this is fresh; a stale entry means the
     /// picker was dealt with by hand.
-    private var codexPickerPane: String?
-    private var codexPickerOpened: Date?
+    private var modelPickerPane: String?
+    private var modelPickerOpened: Date?
+    private var thinkingPickerPane: String?
+    private var thinkingPickerOpened: Date?
     private static let pickerLifetime: TimeInterval = 30
+
+    /// Hardware detents can arrive faster than Herdr RPC round trips. Keep
+    /// picker operations ordered so several quick turns do not each try to
+    /// open a fresh selector.
+    private var controlTask: Task<Void, Never>?
 
     // MARK: - Dial: effort
 
     func handleDial(_ step: Int) {
-        Task { await dial(step) }
+        let previous = controlTask
+        controlTask = Task { [weak self] in
+            await previous?.value
+            await self?.dial(step)
+        }
+    }
+
+    func handleDialClick() {
+        let previous = controlTask
+        controlTask = Task { [weak self] in
+            await previous?.value
+            await self?.dialClick()
+        }
     }
 
     private func dial(_ step: Int) async {
@@ -60,12 +82,50 @@ final class TuneController {
                     paneID: pane,
                     keys: [step > 0 ? Self.codexEffortUpChord : Self.codexEffortDownChord]
                 )
+            } else if isPi(kind) {
+                try await piThinking(step, pane: pane)
             } else {
                 onError?("No effort control for \(agent.agent).")
             }
         } catch {
             onError?(error.localizedDescription)
         }
+    }
+
+    private func dialClick() async {
+        guard let (agent, pane) = await focusedPane() else { return }
+        let kind = agent.agent.lowercased()
+        guard isPi(kind) else { return }
+        do {
+            if pickerIsOpen(pane: thinkingPickerPane, opened: thinkingPickerOpened, target: pane) {
+                try await HerdrClient.sendKeys(paneID: pane, keys: ["enter"])
+                thinkingPickerPane = nil
+                thinkingPickerOpened = nil
+            } else {
+                modelPickerPane = nil
+                modelPickerOpened = nil
+                TunePanelController.shared.hide()
+                try await send(command: "/thinking", to: pane)
+                thinkingPickerPane = pane
+                thinkingPickerOpened = Date()
+            }
+        } catch {
+            onError?(error.localizedDescription)
+        }
+    }
+
+    private func piThinking(_ step: Int, pane: String) async throws {
+        if !pickerIsOpen(pane: thinkingPickerPane, opened: thinkingPickerOpened, target: pane) {
+            modelPickerPane = nil
+            modelPickerOpened = nil
+            TunePanelController.shared.hide()
+            try await send(command: "/thinking", to: pane)
+            thinkingPickerPane = pane
+            // Give Pi one rendering turn before steering the new picker.
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        try await HerdrClient.sendKeys(paneID: pane, keys: [step > 0 ? "down" : "up"])
+        thinkingPickerOpened = Date()
     }
 
     /// Clamped, not wrapping: turning past the top should pin at max, not
@@ -77,17 +137,50 @@ final class TuneController {
     // MARK: - Joystick: model
 
     func handleJoystick(_ direction: Pad.JoystickDirection) {
-        Task { await joystick(direction) }
+        let previous = controlTask
+        controlTask = Task { [weak self] in
+            await previous?.value
+            await self?.joystick(direction)
+        }
     }
 
     private func joystick(_ direction: Pad.JoystickDirection) async {
+        if direction == .east || direction == .west {
+            // Horizontal movement keeps its existing meaning while Pi/Codex's
+            // model picker is open. Otherwise it is an agent-bank gesture.
+            var focusedPaneID: String?
+            do {
+                focusedPaneID = try await HerdrClient.focusedAgent()?.paneID
+            } catch {
+                focusedPaneID = nil
+            }
+            let pickerOpen = focusedPaneID.map {
+                pickerIsOpen(pane: modelPickerPane, opened: modelPickerOpened, target: $0)
+            } ?? false
+            if !pickerOpen {
+                modelPickerPane = nil
+                modelPickerOpened = nil
+                TunePanelController.shared.hide()
+                onAgentPage?(direction == .east ? 1 : -1)
+                return
+            }
+        }
+
         guard let (agent, pane) = await focusedPane() else { return }
         let kind = agent.agent.lowercased()
         do {
             if kind.contains("claude") {
                 try await claudeModel(direction, pane: pane, agent: agent.shortName)
             } else if kind.contains("codex") {
-                try await codexModel(direction, pane: pane, agent: agent.shortName)
+                try await tuiModel(
+                    direction, pane: pane, agent: agent.shortName,
+                    showCodexGuide: true, invertVertical: false
+                )
+            } else if isPi(kind) {
+                try await tuiModel(
+                    direction, pane: pane, agent: agent.shortName,
+                    showCodexGuide: false, invertVertical: true
+                )
             } else {
                 onError?("No model control for \(agent.agent).")
             }
@@ -123,41 +216,46 @@ final class TuneController {
         try await send(command: "/model \(models[index])", to: pane)
     }
 
-    private func codexModel(
+    private func tuiModel(
         _ direction: Pad.JoystickDirection,
         pane: String,
-        agent: String
+        agent: String,
+        showCodexGuide: Bool,
+        invertVertical: Bool
     ) async throws {
-        let pickerOpen = codexPickerPane == pane
-            && Date().timeIntervalSince(codexPickerOpened ?? .distantPast) < Self.pickerLifetime
+        let pickerOpen = pickerIsOpen(pane: modelPickerPane, opened: modelPickerOpened, target: pane)
 
         guard pickerOpen else {
             // Any vertical deflection opens the picker; the rest is steering.
             guard direction == .north || direction == .south else { return }
+            thinkingPickerPane = nil
+            thinkingPickerOpened = nil
             try await send(command: "/model", to: pane)
-            codexPickerPane = pane
-            codexPickerOpened = Date()
-            showCodexModels(agent: agent)
+            modelPickerPane = pane
+            modelPickerOpened = Date()
+            if showCodexGuide { showCodexModels(agent: agent) }
             return
         }
 
         switch direction {
         case .north:
-            try await HerdrClient.sendKeys(paneID: pane, keys: ["up"])
-            showCodexModels(agent: agent)
+            try await HerdrClient.sendKeys(paneID: pane, keys: [invertVertical ? "down" : "up"])
+            if showCodexGuide { showCodexModels(agent: agent) }
         case .south:
-            try await HerdrClient.sendKeys(paneID: pane, keys: ["down"])
-            showCodexModels(agent: agent)
+            try await HerdrClient.sendKeys(paneID: pane, keys: [invertVertical ? "up" : "down"])
+            if showCodexGuide { showCodexModels(agent: agent) }
         case .east:
             try await HerdrClient.sendKeys(paneID: pane, keys: ["enter"])
-            codexPickerPane = nil
+            modelPickerPane = nil
+            modelPickerOpened = nil
             TunePanelController.shared.hide()
         case .west:
             try await HerdrClient.sendKeys(paneID: pane, keys: ["esc"])
-            codexPickerPane = nil
+            modelPickerPane = nil
+            modelPickerOpened = nil
             TunePanelController.shared.hide()
         }
-        codexPickerOpened = Date()
+        modelPickerOpened = Date()
     }
 
     /// Codex's picker is its own; we push arrow keys at it without being told
@@ -173,6 +271,14 @@ final class TuneController {
     }
 
     // MARK: - Plumbing
+
+    private func isPi(_ kind: String) -> Bool {
+        kind == "pi" || kind.contains("pi-coding-agent")
+    }
+
+    private func pickerIsOpen(pane: String?, opened: Date?, target: String) -> Bool {
+        pane == target && Date().timeIntervalSince(opened ?? .distantPast) < Self.pickerLifetime
+    }
 
     private func focusedPane() async -> (HerdrAgent, String)? {
         guard let agent = try? await HerdrClient.focusedAgent(), let pane = agent.paneID else {

@@ -35,8 +35,8 @@ public final class PadEmulator: ObservableObject {
     /// Per-key state, including ids past the 13 physical keys — the firmware
     /// accepts up to AG19 and so does this.
     @Published public private(set) var keys: [Int: Key] = [:]
-    /// Which key ids are bound to an AG keycode on the active layer, and so
-    /// can light at all. Includes the dial (13, 14) and joystick (15–18).
+    /// Which ids are bound to an AG keycode on the active layer. Includes the
+    /// dial (13, 14, 19) and joystick (15–18), though those controls have no LEDs.
     @Published public private(set) var bound: Set<Int> = []
     @Published public private(set) var keysZone = OAI.Zone.dark
     @Published public private(set) var ambientZone = OAI.Zone.dark

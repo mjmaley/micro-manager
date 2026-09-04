@@ -1,9 +1,9 @@
 import AppKit
 
-/// The wide bottom key: taps **right command**, which is Superwhisper's
-/// start/stop.
+/// The wide bottom key: sends **Command+/**, matching this machine's
+/// OpenWhispr `DICTATION_KEY` with tap activation.
 ///
-/// Superwhisper is system-wide and types into whatever holds focus, so this
+/// OpenWhispr is system-wide and types into whatever holds focus, so this
 /// deliberately does not care which agent Herdr has focused, or whether Herdr
 /// is running at all. That is the difference from what this key used to do: it
 /// asked Herdr for the focused agent and forked — Claude Code got a chord
@@ -19,9 +19,8 @@ final class VoiceController {
 
     static let shared = VoiceController()
 
-    /// Right command. Its left twin is a different key code, and Superwhisper
-    /// distinguishes them, so this must be the right-hand one.
-    static let triggerKey: CGKeyCode = 0x36
+    /// ANSI slash (`/`). OpenWhispr's configured chord is Command+/.
+    static let triggerKey: CGKeyCode = 0x2C
 
     /// Mirrors an open take, for the key light.
     var onActiveChange: ((Bool) -> Void)?
@@ -56,11 +55,11 @@ final class VoiceController {
                              virtualKey: Self.triggerKey, keyDown: false)
         else { throw VoiceFailure.eventFailed }
 
-        // A modifier carries its own flag: set on the way down, cleared on the
-        // way up. Skip that and listeners see a command key that never
-        // releases, which leaves the whole machine holding a modifier down.
+        // Flags belong to each synthetic slash event. Keeping Command present
+        // on both halves makes this a complete Command+/ chord without posting
+        // a standalone modifier that could become stuck.
         down.flags = .maskCommand
-        up.flags = []
+        up.flags = .maskCommand
         down.post(tap: .cghidEventTap)
         up.post(tap: .cghidEventTap)
     }
@@ -72,10 +71,10 @@ final class VoiceController {
         var errorDescription: String? {
             switch self {
             case .accessibilityDenied:
-                return "Pressing right command needs the Accessibility permission: "
+                return "Sending Command+/ needs the Accessibility permission: "
                     + "System Settings → Privacy & Security → Accessibility → Micro Manager."
             case .eventFailed:
-                return "Could not synthesise the right command key press."
+                return "Could not synthesise the OpenWhispr Command+/ shortcut."
             }
         }
     }

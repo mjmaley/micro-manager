@@ -44,6 +44,11 @@ public struct BridgeConfig: Sendable {
     public var voiceActiveColor: Int = 0xFF3B30
     /// Text-macro keys: a quiet steel blue — bound, but not status-bearing.
     public var macroColor: Int = 0x90A4AE
+    /// Pi approval controls, matching their semantics rather than agent state.
+    public var fastColor: Int = 0xFFB300
+    public var approveColor: Int = 0x00C853
+    public var rejectColor: Int = 0xFF2D2D
+    public var splitColor: Int = 0x7C4DFF
     public var brightness: Double = 1
     public var speed: Double = 0.5
     /// Leave the key-backlight ZONE alone: keys are painted per-agent instead,
@@ -71,15 +76,16 @@ public enum StatusMapper {
         return "unknown"
     }
 
-    /// One thread entry per agent key: agent slot N takes `Pad.agentKeyIDs[N]`
-    /// — reading order on the pad — and unused keys go dark. Always returns
-    /// exactly `Pad.agentKeyIDs.count` entries, so a vanished agent actively
-    /// clears its key rather than leaving it stale.
+    /// One thread entry per visible agent key: slot N takes
+    /// `Pad.agentKeyIDs[N]` — reading order on the current bank — and unused
+    /// keys go dark. Always returns exactly `Pad.agentKeyIDs.count` entries, so
+    /// a vanished or short final bank actively clears stale keys.
     public static func threads(
         for agents: [HerdrAgent],
-        _ cfg: BridgeConfig = BridgeConfig()
+        _ cfg: BridgeConfig = BridgeConfig(),
+        agentKeyIDs: [Int] = Pad.agentKeyIDs
     ) -> [OAI.Thread] {
-        Pad.agentKeyIDs.enumerated().map { slot, id in
+        agentKeyIDs.enumerated().map { slot, id in
             guard slot < agents.count else {
                 return OAI.Thread(id: id, brightness: 0, effect: .off)
             }
@@ -138,9 +144,21 @@ public enum StatusMapper {
         )
     }
 
+    /// A fixed Pi action key. These stay dim enough that the six session
+    /// status keys remain the visual focus.
+    public static func piActionThread(id: Int, color: Int, _ cfg: BridgeConfig = BridgeConfig()) -> OAI.Thread {
+        OAI.Thread(
+            id: id,
+            color: color,
+            brightness: cfg.brightness * 0.4,
+            effect: .solid,
+            speed: cfg.speed
+        )
+    }
+
     /// One half of the voice key — the callers paint both matrix positions
     /// identically so the single wide keycap reads as one light. Dim white at
-    /// rest; breathing red while a Claude voice take is open.
+    /// rest; breathing red while an OpenWhispr take is open.
     public static func voiceThread(
         id: Int,
         active: Bool,

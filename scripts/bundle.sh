@@ -9,9 +9,10 @@
 #   ./scripts/bundle.sh --install    also copy to /Applications and launch
 #
 # Signing matters more than it looks. macOS keys the Input Monitoring grant to
-# the code signature, so an ad-hoc signature - whose hash changes on every
-# build - forces you to re-grant permission after every rebuild. A real
-# identity gives a stable designated requirement and the grant sticks.
+# the designated requirement. A real identity provides a stable requirement.
+# For local ad-hoc builds we explicitly use the bundle identifier as the
+# requirement; this is less tamper-resistant than a real certificate, but keeps
+# the local permission stable across rebuilds.
 #
 # Set WL_SIGN_IDENTITY to choose the identity explicitly (CI does this);
 # otherwise the first Developer ID or Apple Development identity in the
@@ -110,16 +111,17 @@ fi
 
 if [[ -n "$IDENTITY" ]]; then
     echo "    identity: $IDENTITY"
-    SIGN=(codesign --force --options runtime --timestamp --sign "$IDENTITY")
+    INSPECTOR_SIGN=(codesign --force --options runtime --timestamp --sign "$IDENTITY")
+    APP_SIGN=(codesign --force --options runtime --timestamp --sign "$IDENTITY")
 else
-    echo "    WARNING: no signing identity found, falling back to ad-hoc." >&2
-    echo "    The Input Monitoring grant will not survive rebuilds." >&2
-    SIGN=(codesign --force --sign -)
+    echo "    WARNING: no signing identity found; using a stable local ad-hoc requirement." >&2
+    INSPECTOR_SIGN=(codesign --force --sign - --requirements "=designated => identifier \"$INSPECTOR_BUNDLE_ID\"")
+    APP_SIGN=(codesign --force --sign - --requirements "=designated => identifier \"$BUNDLE_ID\"")
 fi
 
 # Inside out: signing a nested bundle after its host invalidates the host seal.
-"${SIGN[@]}" "$INSPECTOR"
-"${SIGN[@]}" "$APP"
+"${INSPECTOR_SIGN[@]}" "$INSPECTOR"
+"${APP_SIGN[@]}" "$APP"
 codesign --verify --deep --verbose=1 "$APP" 2>&1 | sed 's/^/    /'
 
 if $install; then

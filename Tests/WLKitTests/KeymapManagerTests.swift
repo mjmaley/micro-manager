@@ -64,18 +64,16 @@ final class KeymapManagerTests: XCTestCase {
         XCTAssertTrue(KeymapManager.isAgentKeymapApplied(try KeymapManager.withAgentKeymap(config)))
     }
 
-    /// The dial's rotations become AG codes; its press keeps its keycode.
-    func testApplyingBindsTheDialButNotItsPress() throws {
+    /// The dial's rotations and press become AG codes.
+    func testApplyingBindsTheWholeDial() throws {
         let config = try backupKeymap()
         let next = try KeymapManager.withAgentKeymap(config)
 
-        let original = try XCTUnwrap(KeymapManager.activeLayerLayout(config))
         let layout = try XCTUnwrap(KeymapManager.activeLayerLayout(next))
         let dial = try XCTUnwrap((layout["encoders"] as? [[String]])?.first)
-        let originalDial = try XCTUnwrap((original["encoders"] as? [[String]])?.first)
         XCTAssertEqual(dial[0], "KV_OAI_AG13")
         XCTAssertEqual(dial[1], "KV_OAI_AG14")
-        XCTAssertEqual(dial[2], originalDial[2], "the press is not ours to take")
+        XCTAssertEqual(dial[2], "KV_OAI_AG19")
     }
 
     /// The joystick's four cardinal sectors become AG codes; diagonals keep
@@ -105,6 +103,26 @@ final class KeymapManagerTests: XCTestCase {
         XCTAssertEqual(cardinals[0.75], "KV_OAI_AG17")
         XCTAssertEqual(cardinals[0.00], "KV_OAI_AG18")
         XCTAssertEqual(diagonals, 4, "the diagonal sectors keep their keycodes")
+    }
+
+    func testApplyingToLayerTwoPreservesLayerOne() throws {
+        let config = try backupKeymap()
+        let layerOneBefore = try XCTUnwrap(KeymapManager.layerKeymap(config, layerIndex: 0))
+        let next = try KeymapManager.withAgentKeymap(config, layerIndex: 1)
+
+        XCTAssertEqual(KeymapManager.layerKeymap(next, layerIndex: 0), layerOneBefore)
+        XCTAssertTrue(KeymapManager.isAgentKeymapApplied(next, layerIndex: 1))
+        XCTAssertFalse(KeymapManager.isAgentKeymapApplied(config, layerIndex: 1))
+        for key in Pad.boundKeyIDs {
+            let at = try XCTUnwrap(Pad.position(of: key))
+            XCTAssertEqual(KeymapManager.layerKeymap(next, layerIndex: 1)?[at.row][at.column],
+                           KeymapManager.agCodes[key])
+        }
+    }
+
+    func testMissingTargetLayerIsRejected() throws {
+        let config = try backupKeymap()
+        XCTAssertThrowsError(try KeymapManager.withAgentKeymap(config, layerIndex: 99))
     }
 
     func testApplyingIsIdempotent() throws {

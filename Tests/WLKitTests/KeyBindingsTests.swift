@@ -9,24 +9,22 @@ final class KeyBindingsTests: XCTestCase {
 
     func testMissingFileMeansDefaults() {
         let bindings = KeyBindings()
-        XCTAssertEqual(bindings.text(for: 9), "Open PRs for all active GitButler branches")
-        XCTAssertEqual(bindings.text(for: 12), "Run but pull")
+        XCTAssertNil(bindings.text(for: 9), "row 3 is reserved for Pi controls")
+        XCTAssertNil(bindings.text(for: 12), "key 12 defaults to submit, not text")
         XCTAssertNil(bindings.text(for: 10), "the wide key defaults to voice, not text")
         XCTAssertNil(bindings.text(for: 11))
     }
 
-    /// The defaults are meaningless on a key the pad does not route to a macro,
-    /// so the two lists have to keep agreeing.
-    func testDefaultsSitOnTheMacroKeys() {
-        XCTAssertEqual(KeyBindings.defaults.keys.sorted(), Pad.macroKeyIDs.sorted())
-        XCTAssertFalse(Pad.macroKeyIDs.contains(Pad.landKeyID),
-                       "the land key answers before any macro on it would")
+    /// Every text default must be macro-capable; the submit key remains in the
+    /// configurable set even though it has no default text.
+    func testDefaultsSitOnMacroCapableKeys() {
+        XCTAssertTrue(KeyBindings.defaults.isEmpty)
+        XCTAssertEqual(Pad.macroKeyIDs, [Pad.submitKeyID])
     }
 
-    func testFileOverridesAKeyAndKeepsTheOtherDefault() {
-        let bindings = parse(#"{"keys": {"9": "Ship it"}}"#)
-        XCTAssertEqual(bindings.text(for: 9), "Ship it")
-        XCTAssertEqual(bindings.text(for: 12), "Run but pull")
+    func testFileCanOverrideSubmitWithText() {
+        let bindings = parse(#"{"keys": {"12": "Ship it"}}"#)
+        XCTAssertEqual(bindings.text(for: 12), "Ship it")
     }
 
     /// "10+11" is the wide key spoken of as one: both halves get the string.
@@ -42,11 +40,16 @@ final class KeyBindingsTests: XCTestCase {
         XCTAssertEqual(bindings.text(for: 11), "right half")
     }
 
-    /// An empty string unbinds: the key goes dark rather than typing nothing.
-    func testEmptyStringUnbindsADefault() {
-        let bindings = parse(#"{"keys": {"12": ""}}"#)
+    func testSubmitKeyCanBeOverriddenWithText() {
+        let bindings = parse(#"{"keys": {"12": "Run but pull"}}"#)
+        XCTAssertEqual(bindings.text(for: 12), "Run but pull")
+    }
+
+    /// Empty text removes a macro and restores the key's built-in fallback.
+    func testEmptyStringRemovesTextOverride() {
+        let bindings = parse(#"{"keys": {"9": ""}}"#)
+        XCTAssertNil(bindings.text(for: 9))
         XCTAssertNil(bindings.text(for: 12))
-        XCTAssertEqual(bindings.text(for: 9), "Open PRs for all active GitButler branches")
     }
 
     func testMalformedFileFallsBackToDefaults() {
@@ -64,8 +67,7 @@ final class KeyBindingsTests: XCTestCase {
         let bindings = parse(#"{"claude": {"models": ["opus", "sonnet"], "efforts": ["low", "high"]}}"#)
         XCTAssertEqual(bindings.claudeModels, ["opus", "sonnet"])
         XCTAssertEqual(bindings.claudeEfforts, ["low", "high"])
-        XCTAssertEqual(bindings.text(for: 9), "Open PRs for all active GitButler branches",
-                       "key defaults survive a claude-only config")
+        XCTAssertNil(bindings.text(for: 12), "submit remains an action in a claude-only config")
     }
 
     func testEmptyClaudeListsFallBackToDefaults() {

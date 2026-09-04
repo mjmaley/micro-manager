@@ -56,8 +56,10 @@ public final class WLDevice {
             case .noVendorCollection:
                 return "Found the device, but not its vendor collection (usage page 0xFF00). Nothing to talk to."
             case .openFailed(let r):
-                if r == kIOReturnNotPrivileged || UInt32(bitPattern: r) == 0xE00002C1 {
-                    return "Open refused (0xE00002C1). Grant Input Monitoring to the process running this app, under System Settings → Privacy & Security → Input Monitoring."
+                let code = UInt32(bitPattern: r)
+                if r == kIOReturnNotPrivileged || r == kIOReturnNotPermitted
+                    || code == 0xE00002C1 || code == 0xE00002E2 {
+                    return String(format: "Open refused (0x%08X). Grant Input Monitoring to the process running this app, under System Settings → Privacy & Security → Input Monitoring.", code)
                 }
                 return String(format: "IOHIDDeviceOpen failed (0x%08X)", UInt32(bitPattern: r))
             case .notConnected:
@@ -70,6 +72,7 @@ public final class WLDevice {
                 case 0xE00002C0: name = " — kIOReturnNoDevice"
                 case 0xE00002C5: name = " — kIOReturnExclusiveAccess"
                 case 0xE00002C1: name = " — kIOReturnNotPrivileged"
+                case 0xE00002E2: name = " — kIOReturnNotPermitted"
                 case 0xE00002C7: name = " — kIOReturnUnsupported, wrong report id or interface"
                 default: name = ""
                 }
@@ -104,8 +107,15 @@ public final class WLDevice {
     private var inputBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: reportSize)
     private var rpcAccumulator = ""
     private var debugAccumulator = ""
-    private var pending: [Int: (Any?, String?) -> Void] = [:]
-    private var nextID = 1
+    private struct PendingCall {
+        var method: String
+        var completion: (Any?, String?) -> Void
+    }
+    private var pending: [Int: PendingCall] = [:]
+    // Multiple non-exclusive clients share replies. A randomized starting id
+    // makes accidental collisions with Codex far less likely than every client
+    // beginning at 1 and advancing in lockstep.
+    private var nextID = Int.random(in: 1...998)
 
     public var isConnected: Bool { device != nil || emulatedConnected }
 
@@ -196,15 +206,17 @@ public final class WLDevice {
             emulatedConnected = false
             emulator?.onNotify = nil
             info = nil
-            for (_, done) in pending { done(nil, "disconnected") }
+            for (_, call) in pending { call.completion(nil, "disconnected") }
             pending.removeAll()
             if let reason { onDisconnect?(reason) }
             return
         }
-        guard let dev = device else { return }
-        IOHIDDeviceUnscheduleFromRunLoop(dev, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
-        IOHIDDeviceClose(dev, IOOptionBits(kIOHIDOptionsTypeNone))
-        device = nil
+        let hadTransport = device != nil || manager != nil
+        if let dev = device {
+            IOHIDDeviceUnscheduleFromRunLoop(dev, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+            IOHIDDeviceClose(dev, IOOptionBits(kIOHIDOptionsTypeNone))
+            device = nil
+        }
         if let mgr = manager {
             IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
             manager = nil
@@ -212,9 +224,9 @@ public final class WLDevice {
         info = nil
         rpcAccumulator = ""
         debugAccumulator = ""
-        for (_, done) in pending { done(nil, "disconnected") }
+        for (_, call) in pending { call.completion(nil, "disconnected") }
         pending.removeAll()
-        if let reason { onDisconnect?(reason) }
+        if hadTransport, let reason { onDisconnect?(reason) }
     }
 
     // MARK: - Send
@@ -284,10 +296,10 @@ public final class WLDevice {
         onTX?(method, params, id)
 
         if let completion {
-            pending[id] = completion
+            pending[id] = PendingCall(method: method, completion: completion)
             DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
                 guard let self, let waiting = self.pending.removeValue(forKey: id) else { return }
-                waiting(nil, Failure.timeout(method).errorDescription)
+                waiting.completion(nil, Failure.timeout(method).errorDescription)
             }
         }
         return id
@@ -342,7 +354,15 @@ public final class WLDevice {
                 let error = (decoded["error"] as? [String: Any])?["message"] as? String
                 let result = decoded["result"]
                 onResponse?(id, result, error)
-                if let waiting = pending.removeValue(forKey: id) { waiting(result, error) }
+                if let waiting = pending[id] {
+                    // Responses normally echo the method. If another shared
+                    // client happens to reuse our numeric id, do not resolve a
+                    // different pending operation with its payload.
+                    if let responseMethod = decoded["method"] as? String,
+                       responseMethod != waiting.method { return }
+                    pending.removeValue(forKey: id)
+                    waiting.completion(result, error)
+                }
             } else if let method = (decoded["m"] as? String) ?? (decoded["method"] as? String) {
                 // Device-pushed notification. Note the envelope is abbreviated
                 // here - {"m": method, "p": params} - while responses use the

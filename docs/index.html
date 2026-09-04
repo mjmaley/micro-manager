@@ -354,25 +354,25 @@
       <div class="cap agent" style="background:var(--green)">agent</div>
     </div>
     <div class="pad-row">
-      <div class="cap">stack</div>
-      <div class="cap">tabs</div>
-      <div class="cap">land</div>
-      <div class="cap">macro</div>
+      <div class="cap">fast</div>
+      <div class="cap">appr</div>
+      <div class="cap">rej</div>
+      <div class="cap">split</div>
     </div>
     <div class="pad-row">
       <div class="cap blank" aria-hidden="true"></div>
       <div class="cap wide">voice</div>
-      <div class="cap">macro</div>
+      <div class="cap">submit</div>
     </div>
   </div>
 
   <ul>
-    <li><strong>Stack</strong> floats the GitButler stack for whichever agent has focus, without stealing the keyboard.</li>
-    <li><strong>Tabs</strong> cycles the tabs of the focused Herdr window.</li>
-    <li><strong>Land</strong> lands the focused agent's branches, bottom first, after showing you the plan.</li>
-    <li><strong>Voice</strong> taps right command, starting and stopping Superwhisper.</li>
-    <li><strong>Macro</strong> keys type a string you configure into the agent's prompt.</li>
-    <li>The <strong>dial</strong> tunes reasoning effort; the <strong>joystick</strong> switches model.</li>
+    <li><strong>FAST</strong> grants a pending dangerous command for the Pi Guardrails session.</li>
+    <li><strong>APPR / REJ</strong> allow once or deny the active Guardrails prompt.</li>
+    <li><strong>SPLIT</strong> opens Pi's <code>/fork</code> flow.</li>
+    <li><strong>Voice</strong> sends Command+/, starting and stopping OpenWhispr.</li>
+    <li><strong>Submit</strong> sends Enter to the focused Herdr pane.</li>
+    <li>The <strong>dial</strong> tunes reasoning effort; the <strong>joystick</strong> switches model and pages agent banks with left/right when no picker is open.</li>
   </ul>
 
   <h2>Installing</h2>
@@ -380,6 +380,7 @@
     <li>Download, unzip, and drag <code>MicroManager.app</code> to your Applications folder.</li>
     <li>Launch it. macOS will ask for <strong>Input Monitoring</strong> — grant it. This is not optional: without it the app cannot talk to the pad at all.</li>
     <li>Toggle the manager off and on from the menu-bar panel so it reconnects with the new permission.</li>
+    <li>Install <code>@aliou/pi-guardrails</code> with <code>pi install npm:@aliou/pi-guardrails</code>, then run <code>/guardrails:onboarding</code> in Pi.</li>
   </ol>
 
   <div class="card">
@@ -417,10 +418,10 @@
 cd micro-manager
 ./scripts/bundle.sh --install</code></pre>
   <p>
-    Requires a Swift 5.9 toolchain. The script signs with the first Developer ID
-    or Apple Development identity in your keychain — which matters more than it
-    sounds, because macOS keys the Input Monitoring grant to the signature, and
-    an ad-hoc one changes on every build.
+    Requires a Swift 5.9 toolchain. The script prefers the first Developer ID
+    or Apple Development identity in your keychain. When none is available it
+    uses a stable local ad-hoc requirement, because macOS keys the Input
+    Monitoring grant to the designated code requirement.
   </p>
 
 </main>

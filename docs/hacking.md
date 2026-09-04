@@ -514,16 +514,17 @@ debounced signals instead of a raw stream to threshold yourself.
 
 ### The dial
 
-`layout.encoders` is a list of `[clockwise, counter-clockwise, press]`. Bind the
-two rotation slots and leave the press alone unless you want it:
+`layout.encoders` is a list of `[clockwise, counter-clockwise, press]`:
 
 ```js
 layer.layout.encoders[0][0] = "KV_OAI_AG13";   // CW
 layer.layout.encoders[0][1] = "KV_OAI_AG14";   // CCW
+layer.layout.encoders[0][2] = "KV_OAI_AG19";   // press
 ```
 
-Each detent now arrives as `AG13` / `AG14` through the same notification
-handler. There is nothing at index 13/14 to light — these ids are inputs only.
+Each action now arrives as `AG13`, `AG14`, or `AG19` through the same
+notification handler. There is nothing at those indices to light — these ids
+are inputs only. Micro Manager uses the press to confirm Pi's thinking picker.
 
 ### The joystick
 
@@ -624,7 +625,7 @@ found`, which is correct and not a sign of trouble.
 | `KV_OAI_AG00`–`KV_OAI_AG12` | the 13 keys, in matrix order |
 | `KV_OAI_AG13` / `KV_OAI_AG14` | dial clockwise / counter-clockwise |
 | `KV_OAI_AG15`–`KV_OAI_AG18` | joystick north / west / south / east |
-| up to `KV_OAI_AG19` | the table's limit — clear this far when blanking |
+| `KV_OAI_AG19` | dial press; also the table's limit |
 
 ### Field-name cheatsheet
 

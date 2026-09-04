@@ -28,6 +28,9 @@ public final class BridgeController: ObservableObject {
     @Published public private(set) var firmware = "—"
     @Published public private(set) var battery: String?
     @Published public private(set) var agents: [HerdrAgent] = []
+    /// The six-agent bank currently shown on the pad. Bank zero is the first
+    /// six agents in Herdr's live ordering.
+    @Published public private(set) var agentPage = 0
     @Published public private(set) var keyColors: [Int: Color] = [:]
     @Published public private(set) var keyEffects: [Int: OAI.Effect] = [:]
     @Published public private(set) var aggregateState: String?
@@ -41,8 +44,30 @@ public final class BridgeController: ObservableObject {
     @Published public private(set) var stackPanelOpen = false
     /// Same for the land window.
     @Published public private(set) var landPanelOpen = false
-    /// Whether a Claude voice take is open, for the voice key's light.
+    /// Whether an OpenWhispr take is open, for the voice key's light.
     @Published public private(set) var voiceActive = false
+    /// Device-specific geometry and the layer reserved for Herdr. Codex Micro
+    /// keeps its native integration on Layer 1 and defaults Herdr to Layer 2.
+    @Published public private(set) var padConfiguration = Pad.creatorMicro2
+    /// `device.status.layer_index`, which firmware 0.6.2 reports one-based.
+    @Published public private(set) var activeLayerNumber: Int?
+
+    public var herdrLayerNumber: Int { padConfiguration.herdrLayerNumber }
+    public var isHerdrLayerActive: Bool { activeLayerNumber == herdrLayerNumber }
+    public var agentPageSize: Int { max(1, padConfiguration.agentKeyIDs.count) }
+    public var agentPageCount: Int {
+        max(1, (agents.count + agentPageSize - 1) / agentPageSize)
+    }
+    public var visibleAgents: [HerdrAgent] {
+        let start = min(agentPage * agentPageSize, agents.count)
+        return Array(agents.dropFirst(start).prefix(agentPageSize))
+    }
+    public var agentPageLabel: String? {
+        guard !agents.isEmpty else { return nil }
+        let start = agentPage * agentPageSize
+        let end = min(start + agentPageSize, agents.count)
+        return "\(start + 1)–\(end) of \(agents.count)"
+    }
 
     public var config: BridgeConfig
     /// Text macros for the spare keys, reloaded on every bridge start so a
@@ -54,16 +79,26 @@ public final class BridgeController: ObservableObject {
     public var onStackKey: (() -> Void)?
     /// Called when the land key is pressed; same split as `onStackKey`.
     public var onLandKey: (() -> Void)?
+    /// Row-3 Pi controls, matching the FAST/APPR/REJ/SPLIT keycaps.
+    public var onFastKey: (() -> Void)?
+    public var onApproveKey: (() -> Void)?
+    public var onRejectKey: (() -> Void)?
+    public var onSplitKey: (() -> Void)?
     /// Called when either half of the wide voice key is pressed.
     public var onVoiceKey: (() -> Void)?
     /// Called per dial detent: +1 clockwise, -1 counter-clockwise.
     public var onDial: ((Int) -> Void)?
+    /// Called when the dial is pressed; Pi uses it to confirm a selector.
+    public var onDialClick: (() -> Void)?
     /// Called when the joystick enters a cardinal sector.
     public var onJoystick: ((Pad.JoystickDirection) -> Void)?
     /// Consulted before any key does its normal job. Returning true consumes
     /// the press — this is how a pending land confirmation turns every other
     /// key into "cancel" without those keys also doing their usual work.
     public var onKeyIntercept: ((Int) -> Bool)?
+    /// Successful, current Herdr snapshots, independent of HID connectivity.
+    public var onAgentSnapshot: (([HerdrAgent], String) -> Void)?
+    public var onAgentObservationReset: (() -> Void)?
 
     // MARK: - Internals
 
@@ -73,11 +108,26 @@ public final class BridgeController: ObservableObject {
     private var lifecycle: HerdrEventStream?
     private var statusStreams: [String: HerdrEventStream] = [:]
     private var pollTask: Task<Void, Never>?
+    private var layerMonitorTask: Task<Void, Never>?
     private var debounceTask: Task<Void, Never>?
     private var reopenTask: Task<Void, Never>?
+    private var wakeTask: Task<Void, Never>?
+    private var snapshotSequence = 0
     private var lastFingerprint: String?
+    private var lastPublishedFingerprint: String?
     private var issuedIDs = Set<Int>()
+    private var statusFailureCount = 0
+    /// The submit switch can occasionally replay a press while the shared HID
+    /// transport is reconnecting. Keep its debounce isolated from approvals
+    /// and other controls, where every deliberate press must be delivered.
+    private var lastSubmitPressAt: TimeInterval?
+    /// HID handles can survive display sleep while losing permission to send
+    /// reports. Track suspension explicitly so wake always opens a fresh handle.
+    private var suspendedForSystemInactivity = false
     private var warnedPermission = false
+    /// Codex Micro's single wide key drives both matrix switches. Keep their
+    /// down-state as one gesture so AG10+AG11 toggles voice exactly once.
+    private var wideKeysDown = Set<Int>()
 
     public init(config: BridgeConfig = BridgeConfig()) {
         self.config = config
@@ -102,23 +152,72 @@ public final class BridgeController: ObservableObject {
         device.onDisconnect = { [weak self] _ in
             guard let self else { return }
             self.deviceConnected = false
+            self.activeLayerNumber = nil
             self.lastFingerprint = nil
             if self.isRunning { self.scheduleReopen() }
+        }
+        device.onWriteError = { [weak self] _, message in
+            self?.markDeviceUnavailable(message)
         }
         device.onTX = { [weak self] _, _, id in
             self?.issuedIDs.insert(id)
         }
         device.onResponse = { [weak self] id, _, _ in
             guard let self else { return }
-            // A reply to an id we never sent came from another client.
-            if self.issuedIDs.remove(id) == nil { self.contendingClient = true }
+            // A reply to an id we never sent came from another client. Its
+            // preceding request may have changed the global lighting, so let
+            // the next ordinary refresh repaint without hammering the device
+            // on every poll.
+            if self.issuedIDs.remove(id) == nil {
+                self.contendingClient = true
+                self.lastFingerprint = nil
+            }
         }
         device.onNotification = { [weak self] method, params in
-            guard let self, method == OAI.notifyHID else { return }
-            guard let dict = params as? [String: Any] else { return }
-            guard (dict["act"] as? Int) == 1 else { return }   // press, not release
-            guard let index = OAI.agIndex(dict["k"] as? String) else { return }
-            self.handleKeyPress(index)
+            guard let self, method == OAI.notifyHID,
+                  let dict = params as? [String: Any],
+                  let action = dict["act"] as? Int,
+                  let index = OAI.agIndex(dict["k"] as? String)
+            else { return }
+
+            if Pad.voiceKeyIDs.contains(index) {
+                if action == 0 {
+                    self.wideKeysDown.remove(index)
+                    return
+                }
+                guard action == 1 else { return }
+                let firstHalf = self.wideKeysDown.isEmpty
+                self.wideKeysDown.insert(index)
+                guard firstHalf else { return }
+            } else {
+                guard action == 1 else { return }   // press, not release
+            }
+
+            if index == Pad.submitKeyID {
+                let now = ProcessInfo.processInfo.systemUptime
+                if let previous = self.lastSubmitPressAt, now - previous < 0.18 { return }
+                self.lastSubmitPressAt = now
+            }
+
+            // On Codex Micro, the verified Layer 1 map uses ACT06...ACT12 and
+            // proprietary encoder events. Receiving AG06 or above therefore
+            // proves this event came from Herdr's Layer 2; dispatch it directly
+            // instead of risking an approval press on an unnecessary status
+            // round-trip. AG00...AG05 exist on both layers and still require a
+            // fresh layer check.
+            if self.padConfiguration.isCodexMicro, self.keymapReady,
+               index >= Pad.fastKeyID {
+                self.handleKeyPress(index)
+                return
+            }
+
+            Task { [weak self] in
+                guard let self,
+                      await self.updateDeviceStatus() != nil,
+                      self.isHerdrLayerActive
+                else { return }
+                self.handleKeyPress(index)
+            }
         }
     }
 
@@ -133,50 +232,131 @@ public final class BridgeController: ObservableObject {
         isRunning = true
         lastError = nil
         contendingClient = false
+        wideKeysDown.removeAll()
+        lastSubmitPressAt = nil
         keyBindings = KeyBindings.load()
 
         await openDevice()
         startLifecycleStream()
-        await refresh()
+        await refresh(forcePaint: true)
+        startLayerMonitor()
 
+        startPoll()
+    }
+
+    public func stop() async {
+        isRunning = false
+        snapshotSequence += 1
+        onAgentObservationReset?()
+        pollTask?.cancel(); pollTask = nil
+        layerMonitorTask?.cancel(); layerMonitorTask = nil
+        debounceTask?.cancel(); debounceTask = nil
+        reopenTask?.cancel(); reopenTask = nil
+        wakeTask?.cancel(); wakeTask = nil
+        suspendedForSystemInactivity = false
+        statusFailureCount = 0
+        wideKeysDown.removeAll()
+        lastSubmitPressAt = nil
+        issuedIDs.removeAll()
+        lifecycle?.stop(); lifecycle = nil
+        statusStreams.values.forEach { $0.stop() }
+        statusStreams.removeAll()
+        lastFingerprint = nil
+        lastPublishedFingerprint = nil
+
+        // Switching off clears the lights but deliberately leaves the keymap
+        // alone: rebinding is a flash write, and the keys light instantly on
+        // the way back in if the bindings are still there.
+        if device.isConnected {
+            // Never blank Codex's Layer 1 while shutting down from another
+            // layer. If Herdr owns the visible layer, leave it clean.
+            if isHerdrLayerActive { await allLightsOff() }
+            device.disconnect(reason: nil)
+        }
+        deviceConnected = false
+        activeLayerNumber = nil
+        keyColors = [:]
+        keyEffects = [:]
+        aggregateState = nil
+        agents = []
+        agentPage = 0
+    }
+
+    // MARK: - Device
+
+    /// Blank Herdr's layer and release the HID handle before the display, login
+    /// session, or machine sleeps. The pad remains USB-powered and otherwise
+    /// keeps its last firmware lighting indefinitely.
+    public func prepareForSystemInactivity() {
+        guard isRunning, !suspendedForSystemInactivity else { return }
+        suspendedForSystemInactivity = true
+        snapshotSequence += 1
+        onAgentObservationReset?()
+
+        pollTask?.cancel(); pollTask = nil
+        layerMonitorTask?.cancel(); layerMonitorTask = nil
+        debounceTask?.cancel(); debounceTask = nil
+        reopenTask?.cancel(); reopenTask = nil
+        wakeTask?.cancel(); wakeTask = nil
+        lifecycle?.stop(); lifecycle = nil
+        statusStreams.values.forEach { $0.stop() }
+        statusStreams.removeAll()
+        wideKeysDown.removeAll()
+        lastSubmitPressAt = nil
+
+        // Do not await replies: sleep may follow immediately. SetReport itself
+        // is synchronous, so both messages reach the device before we close.
+        if device.isConnected, isHerdrLayerActive { allLightsOffImmediately() }
+        device.disconnect(reason: nil)
+        issuedIDs.removeAll()
+        deviceConnected = false
+        activeLayerNumber = nil
+        lastFingerprint = nil
+    }
+
+    /// Reopen from scratch after screen/session wake. A short delay lets macOS
+    /// restore the HID service and Input Monitoring authorization first.
+    public func resumeAfterSystemInactivity() {
+        guard isRunning, suspendedForSystemInactivity else { return }
+        suspendedForSystemInactivity = false
+        wakeTask?.cancel()
+        wakeTask = Task { [weak self] in
+            do {
+                // Both clients rebuild their HID transports on wake. Giving
+                // Codex a short head start avoids interleaving two initial
+                // multi-report lighting writes on firmware 0.6.2.
+                try await Task.sleep(nanoseconds: 3_000_000_000)
+            } catch {
+                return
+            }
+            guard let self, self.isRunning, !self.suspendedForSystemInactivity else { return }
+            self.wakeTask = nil
+            await self.openDevice()
+            self.startLifecycleStream()
+            self.startLayerMonitor()
+            self.startPoll()
+            if self.deviceConnected { await self.forceRepaint() }
+        }
+    }
+
+    private func startPoll() {
+        pollTask?.cancel()
         pollTask = Task { [weak self] in
             guard let self else { return }
             while !Task.isCancelled {
                 let interval = self.config.pollInterval
                 try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
                 if Task.isCancelled { break }
-                await self.refresh()
+                // Poll Herdr as a liveness backstop. Shared-client responses
+                // invalidate the lighting fingerprint, so this refresh also
+                // repairs a real overwrite without unconditional HID writes.
+                await self.refresh(updateLayer: false)
             }
         }
     }
 
-    public func stop() async {
-        isRunning = false
-        pollTask?.cancel(); pollTask = nil
-        debounceTask?.cancel(); debounceTask = nil
-        reopenTask?.cancel(); reopenTask = nil
-        lifecycle?.stop(); lifecycle = nil
-        statusStreams.values.forEach { $0.stop() }
-        statusStreams.removeAll()
-        lastFingerprint = nil
-
-        // Switching off clears the lights but deliberately leaves the keymap
-        // alone: rebinding is a flash write, and the keys light instantly on
-        // the way back in if the bindings are still there.
-        if device.isConnected {
-            await allLightsOff()
-            device.disconnect(reason: nil)
-        }
-        deviceConnected = false
-        keyColors = [:]
-        keyEffects = [:]
-        aggregateState = nil
-        agents = []
-    }
-
-    // MARK: - Device
-
     private func openDevice() async {
+        guard isRunning, !suspendedForSystemInactivity else { return }
         // Ask for Input Monitoring explicitly. hidapi-style opens just fail
         // with a privilege violation without ever raising the prompt, which
         // reads as a bug rather than a permission.
@@ -189,7 +369,16 @@ public final class BridgeController: ObservableObject {
             deviceConnected = true
             permissionDenied = false
             warnedPermission = false
+            statusFailureCount = 0
             deviceName = device.info?.product ?? "Work Louder device"
+            if let info = device.info {
+                var detected = Pad.configuration(productID: info.productID, product: info.product)
+                if let value = ProcessInfo.processInfo.environment["WL_HERDR_LAYER"],
+                   let number = Int(value), number > 0 {
+                    detected = detected.withHerdrLayer(number: number)
+                }
+                padConfiguration = detected
+            }
             lastError = nil
         } catch {
             deviceConnected = false
@@ -209,29 +398,26 @@ public final class BridgeController: ObservableObject {
            let text = dict["version"] as? String {
             firmware = text
         }
-        if let status = try? await device.callAsync("device.status"),
-           let dict = status as? [String: Any],
-           let percent = dict["battery"] as? Int {
-            let charging = (dict["is_charging"] as? Bool) == true
-            battery = "\(percent)%\(charging ? " ⚡" : "")"
-        }
-
+        guard deviceConnected else { return }
+        _ = await updateDeviceStatus()
+        guard deviceConnected else { return }
         await ensureKeymap()
     }
 
-    /// Per-key lighting only works on keys bound to `KV_OAI_AG*` on the active
+    /// Per-key lighting only works on keys bound to `KV_OAI_AG*` on the Herdr
     /// layer, and nothing reports a mismatch — `v.oai.thstatus` answers
     /// `{"ok":1}` for a key it cannot light. So check rather than assume.
     private func ensureKeymap() async {
+        let layerIndex = padConfiguration.herdrLayerIndex
         do {
             if config.manageKeymap {
-                _ = try await KeymapManager.apply(device)
+                _ = try await KeymapManager.apply(device, layerIndex: layerIndex)
                 keymapReady = true
             } else {
                 let cfg = try await KeymapManager.read(device)
-                keymapReady = KeymapManager.isAgentKeymapApplied(cfg)
+                keymapReady = KeymapManager.isAgentKeymapApplied(cfg, layerIndex: layerIndex)
                 if !keymapReady {
-                    lastError = "The agent keys and the stack key are not bound to KV_OAI_AG00..AG06, so per-key colours will do nothing."
+                    lastError = "Layer \(herdrLayerNumber) is not bound to the Herdr AG keymap, so per-key colours will do nothing."
                 }
             }
         } catch {
@@ -240,8 +426,72 @@ public final class BridgeController: ObservableObject {
         }
     }
 
+    /// Refreshes battery and active-layer state. Returns whether the layer
+    /// changed, or nil when it could not obtain a fresh status. The firmware
+    /// reports `layer_index` one-based on the tested Codex Micro firmware.
+    @discardableResult
+    private func updateDeviceStatus() async -> Bool? {
+        guard deviceConnected, !suspendedForSystemInactivity else { return nil }
+
+        let status: [String: Any]
+        do {
+            guard let response = try await device.callAsync("device.status") as? [String: Any]
+            else { throw WLDevice.Failure.rpc("device.status", "unexpected response") }
+            status = response
+            statusFailureCount = 0
+        } catch {
+            statusFailureCount += 1
+            // A transient shared-client collision can lose a response. Three
+            // consecutive failures mean the handle is no longer trustworthy.
+            if statusFailureCount >= 3 { markDeviceUnavailable(error.localizedDescription) }
+            return nil
+        }
+
+        if let percent = status["battery"] as? Int {
+            let charging = (status["is_charging"] as? Bool) == true
+            let value = "\(percent)%\(charging ? " ⚡" : "")"
+            if battery != value { battery = value }
+        }
+        let previous = activeLayerNumber
+        if let layer = status["layer_index"] as? Int, activeLayerNumber != layer {
+            activeLayerNumber = layer
+        }
+        let changed = previous != activeLayerNumber
+        if changed { lastFingerprint = nil }
+        return changed
+    }
+
+    /// Layer changes have no known notification, so watch the cheap status RPC.
+    /// Input events still confirm the layer synchronously before dispatch.
+    private func startLayerMonitor() {
+        layerMonitorTask?.cancel()
+        layerMonitorTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_250_000_000)
+                if Task.isCancelled || !self.isRunning { break }
+                let changed = await self.updateDeviceStatus()
+                if changed == true && self.isHerdrLayerActive {
+                    await self.refresh(forcePaint: true, updateLayer: false)
+                }
+            }
+        }
+    }
+
+    private func markDeviceUnavailable(_ message: String) {
+        guard !suspendedForSystemInactivity, deviceConnected || device.isConnected else { return }
+        deviceConnected = false
+        activeLayerNumber = nil
+        lastFingerprint = nil
+        statusFailureCount = 0
+        lastError = message
+        device.disconnect(reason: nil)
+        issuedIDs.removeAll()
+        scheduleReopen()
+    }
+
     private func scheduleReopen() {
-        guard isRunning, reopenTask == nil else { return }
+        guard isRunning, !suspendedForSystemInactivity, reopenTask == nil else { return }
         reopenTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
@@ -314,24 +564,40 @@ public final class BridgeController: ObservableObject {
 
     public func forceRepaint() async {
         lastFingerprint = nil
-        await refresh()
+        await refresh(forcePaint: true)
     }
 
-    private func refresh() async {
-        guard isRunning else { return }
+    private func refresh(forcePaint: Bool = false, updateLayer: Bool = false) async {
+        guard isRunning, !suspendedForSystemInactivity else { return }
+        snapshotSequence += 1
+        let sequence = snapshotSequence
+        if updateLayer { _ = await updateDeviceStatus() }
+        let socket = HerdrClient.socketPath()
+        let identity = AgentNotificationTarget.socketIdentity(at: socket)
 
         let fetched: [HerdrAgent]
         do {
             fetched = try await HerdrClient.listAgents()
         } catch {
+            guard sequence == snapshotSequence else { return }
+            onAgentObservationReset?()
             lastError = error.localizedDescription
             return
         }
-        lastError = nil
-        agents = fetched
+        guard sequence == snapshotSequence, isRunning, !suspendedForSystemInactivity else { return }
+        if let identity, identity == AgentNotificationTarget.socketIdentity(at: socket) {
+            onAgentSnapshot?(fetched, identity)
+        } else {
+            onAgentObservationReset?()
+        }
+        if lastError != nil { lastError = nil }
+        if agents != fetched { agents = fetched }
+        let validPage = min(agentPage, agentPageCount - 1)
+        if agentPage != validPage { agentPage = validPage }
         reconcileStatusStreams(fetched)
 
         let state = StatusMapper.aggregate(fetched, config)
+        let pageAgents = visibleAgents
         // Macro and voice keys share ids, so the binding decides each key's
         // light: configured text wins, the wide key falls back to voice.
         let flexKeys = (Pad.macroKeyIDs + Pad.voiceKeyIDs).map { key -> OAI.Thread in
@@ -341,12 +607,18 @@ public final class BridgeController: ObservableObject {
             if Pad.voiceKeyIDs.contains(key) {
                 return StatusMapper.voiceThread(id: key, active: voiceActive, config)
             }
+            if key == Pad.submitKeyID { return StatusMapper.macroThread(id: key, config) }
             return OAI.Thread(id: key, brightness: 0, effect: .off)
         }
-        let threads = StatusMapper.threads(for: fetched, config)
-            + [StatusMapper.stackThread(open: stackPanelOpen, config),
-               StatusMapper.tabCycleThread(config),
-               StatusMapper.landThread(open: landPanelOpen, config)]
+        let threads = StatusMapper.threads(
+            for: pageAgents,
+            config,
+            agentKeyIDs: padConfiguration.agentKeyIDs
+        )
+            + [StatusMapper.piActionThread(id: Pad.fastKeyID, color: config.fastColor, config),
+               StatusMapper.piActionThread(id: Pad.approveKeyID, color: config.approveColor, config),
+               StatusMapper.piActionThread(id: Pad.rejectKeyID, color: config.rejectColor, config),
+               StatusMapper.piActionThread(id: Pad.splitKeyID, color: config.splitColor, config)]
             + flexKeys
 
         // Fingerprint the whole rendered picture, not just the aggregate, so
@@ -355,10 +627,20 @@ public final class BridgeController: ObservableObject {
             "\(thread.id):\(thread.color ?? -1):\(thread.effect?.rawValue ?? -1):\(thread.brightness ?? -1)"
         }.joined(separator: "|") + "|agg:\(state ?? "-")"
 
-        publishKeyState(threads)
-        aggregateState = state
+        if fingerprint != lastPublishedFingerprint {
+            lastPublishedFingerprint = fingerprint
+            publishKeyState(threads)
+            aggregateState = state
+        }
 
-        guard fingerprint != lastFingerprint else { return }
+        // Lighting is a global physical surface, not stored per layer. Leave it
+        // entirely to Codex outside the Herdr layer; paint immediately when we
+        // enter Layer 2 and after evidence that another shared client wrote.
+        guard isHerdrLayerActive else {
+            lastFingerprint = nil
+            return
+        }
+        guard forcePaint || fingerprint != lastFingerprint else { return }
         lastFingerprint = fingerprint
         await apply(state: state, threads: threads)
     }
@@ -377,7 +659,7 @@ public final class BridgeController: ObservableObject {
     }
 
     private func apply(state: String?, threads: [OAI.Thread]) async {
-        guard deviceConnected else { return }
+        guard deviceConnected, isHerdrLayerActive else { return }
         do {
             _ = try await device.callAsync(OAI.methodThreads, params: OAI.threadsParams(threads))
             let zone = StatusMapper.zone(for: state, config) ?? .dark
@@ -397,14 +679,27 @@ public final class BridgeController: ObservableObject {
     /// Thread state paints over zone state, so clearing the zones alone leaves
     /// the pad lit. Both have to go.
     private func allLightsOff() async {
-        let threads = (0...Pad.maxThreadID).map {
-            OAI.Thread(id: $0, brightness: 0, effect: .off, syncKeys: false, syncAmbient: false)
-        }
+        let threads = offThreads()
         _ = try? await device.callAsync(OAI.methodThreads, params: OAI.threadsParams(threads))
         _ = try? await device.callAsync(
             OAI.methodRGBConfig,
             params: OAI.rgbConfigParams(keys: .dark, ambient: .dark)
         )
+    }
+
+    private func allLightsOffImmediately() {
+        let threads = offThreads()
+        device.call(OAI.methodThreads, params: OAI.threadsParams(threads))
+        device.call(
+            OAI.methodRGBConfig,
+            params: OAI.rgbConfigParams(keys: .dark, ambient: .dark)
+        )
+    }
+
+    private func offThreads() -> [OAI.Thread] {
+        (0...Pad.maxThreadID).map {
+            OAI.Thread(id: $0, brightness: 0, effect: .off, syncKeys: false, syncAmbient: false)
+        }
     }
 
     // MARK: - Key presses
@@ -413,12 +708,14 @@ public final class BridgeController: ObservableObject {
     /// has to agree with `Pad`, so keep the dispatch in a single switch.
     public func handleKeyPress(_ index: Int) {
         if onKeyIntercept?(index) == true { return }
-        if index == Pad.stackKeyID {
-            onStackKey?()
-        } else if index == Pad.tabCycleKeyID {
-            Task { await cycleTabs() }
-        } else if index == Pad.landKeyID {
-            onLandKey?()
+        if index == Pad.fastKeyID {
+            onFastKey?()
+        } else if index == Pad.approveKeyID {
+            onApproveKey?()
+        } else if index == Pad.rejectKeyID {
+            onRejectKey?()
+        } else if index == Pad.splitKeyID {
+            onSplitKey?()
         } else if Pad.macroKeyIDs.contains(index) || Pad.voiceKeyIDs.contains(index) {
             // A configured text macro wins over the key's built-in role, which
             // is how the config file may repurpose the wide voice key.
@@ -426,13 +723,32 @@ public final class BridgeController: ObservableObject {
                 Task { await injectPrompt(text) }
             } else if Pad.voiceKeyIDs.contains(index) {
                 onVoiceKey?()
+            } else if index == Pad.submitKeyID {
+                Task { await submitFocusedPane() }
             }
         } else if index == Pad.dialUpID || index == Pad.dialDownID {
             onDial?(index == Pad.dialUpID ? 1 : -1)
+        } else if index == Pad.dialClickID {
+            onDialClick?()
         } else if let direction = Pad.JoystickDirection(keyID: index) {
             onJoystick?(direction)
-        } else if let slot = Pad.agentSlot(for: index) {
+        } else if let slot = padConfiguration.agentSlot(for: index) {
             Task { await focusSlot(slot) }
+        }
+    }
+
+    /// Sends Enter to the focused Herdr pane.
+    public func submitFocusedPane() async {
+        do {
+            guard let agent = try await HerdrClient.focusedAgent(),
+                  let pane = agent.paneID
+            else {
+                lastError = "Nothing has focus in Herdr right now."
+                return
+            }
+            try await HerdrClient.sendKeys(paneID: pane, keys: ["enter"])
+        } catch {
+            lastError = error.localizedDescription
         }
     }
 
@@ -489,15 +805,23 @@ public final class BridgeController: ObservableObject {
         await forceRepaint()
     }
 
-    /// Slot N is the Nth key in reading order (`Pad.agentKeyIDs[N]`) — the
-    /// same mapping the lighting uses, which is what makes the key you look at
-    /// the key you press.
-    ///
-    /// Herdr selects the pane but leaves the terminal wherever it was in the
-    /// window order, so an agent key pressed from a browser used to move a
-    /// cursor you could not see. The terminal comes forward with it.
-    public func focusSlot(_ index: Int) async {
-        guard index >= 0, index < agents.count else { return }
+    /// Move the six-agent bank shown on the pad. Joystick east/right advances
+    /// and west/left goes back; wrapping makes every bank reachable.
+    public func scrollAgentPage(by delta: Int) {
+        guard delta != 0, agentPageCount > 1 else { return }
+        agentPage = (agentPage + delta % agentPageCount + agentPageCount) % agentPageCount
+        lastFingerprint = nil
+        Task { [weak self] in
+            guard let self else { return }
+            await self.forceRepaint()
+        }
+    }
+
+    /// Slot N is the Nth agent in the currently visible bank, in the detected
+    /// pad's reading order. The terminal comes forward with the focused pane.
+    public func focusSlot(_ slot: Int) async {
+        let index = agentPage * agentPageSize + slot
+        guard slot >= 0, slot < agentPageSize, index < agents.count else { return }
         guard let target = agents[index].focusTarget else { return }
         do {
             try await HerdrClient.focusAgent(target)
@@ -505,6 +829,34 @@ public final class BridgeController: ObservableObject {
         } catch {
             lastError = error.localizedDescription
         }
+    }
+
+    /// Validate against a fresh snapshot before honoring an OS notification.
+    /// This also works when the hardware bridge is off or the pad is unplugged.
+    public func focusNotificationTarget(_ target: AgentNotificationTarget) async throws {
+        let socket = HerdrClient.socketPath()
+        guard target.socketPath == socket,
+              target.socketIdentity == AgentNotificationTarget.socketIdentity(at: socket) else {
+            throw HerdrError.api("This notification belongs to a previous or different Herdr server.")
+        }
+        let current = try await HerdrClient.listAgents()
+        guard let index = current.firstIndex(where: { target.matches($0) }),
+              target.socketIdentity == AgentNotificationTarget.socketIdentity(at: socket) else {
+            throw HerdrError.api("The agent pane for this notification is no longer available.")
+        }
+        try await HerdrClient.focusAgent(target.paneID)
+        agentPage = index / agentPageSize
+        raiseTerminal()
+        if isRunning { await forceRepaint() }
+    }
+
+    public static var terminalBundleID: String {
+        ProcessInfo.processInfo.environment["WL_TERMINAL_BUNDLE_ID"]
+            .flatMap { $0.isEmpty ? nil : $0 } ?? defaultTerminalBundleID
+    }
+
+    public static var terminalIsActive: Bool {
+        NSWorkspace.shared.frontmostApplication?.bundleIdentifier == terminalBundleID
     }
 
     /// The app Herdr's panes live in. Override with `WL_TERMINAL_BUNDLE_ID` if
@@ -521,8 +873,7 @@ public final class BridgeController: ObservableObject {
     /// `openApplication` on an already-running app raises it the way `open -a`
     /// does.
     private func raiseTerminal() {
-        let identifier = ProcessInfo.processInfo.environment["WL_TERMINAL_BUNDLE_ID"]
-            .flatMap { $0.isEmpty ? nil : $0 } ?? Self.defaultTerminalBundleID
+        let identifier = Self.terminalBundleID
         guard let app = NSRunningApplication
             .runningApplications(withBundleIdentifier: identifier).first
         else { return }

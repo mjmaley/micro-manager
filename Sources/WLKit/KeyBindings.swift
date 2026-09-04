@@ -7,9 +7,7 @@ import Foundation
 ///
 ///     {
 ///       "keys": {
-///         "9": "Open PRs for all active GitButler branches",
-///         "12": "Run but pull",
-///         "10+11": "Summarise what you are working on"
+///         "12": "Run the tests before submitting"
 ///       },
 ///       "claude": { "models": ["fable", "opus"], "efforts": ["low", "high"] },
 ///       "codex":  { "models": ["gpt-5.6-sol", "gpt-5.6-codex"] }
@@ -18,8 +16,8 @@ import Foundation
 /// A bound string is injected into the focused agent's prompt, unsubmitted.
 /// `"10+11"` addresses the wide key as one; `"10"` and `"11"` address its
 /// halves separately. Keys the file does not mention keep their defaults —
-/// 9 and 12 have the defaults below, the wide key defaults to the voice key.
-/// An empty string unbinds a key outright.
+/// 12 submits, and the wide key controls voice.
+/// An empty string restores a key's non-macro fallback (Enter for key 12).
 public struct KeyBindings: Sendable, Equatable {
 
     public private(set) var texts: [Int: String]
@@ -35,10 +33,7 @@ public struct KeyBindings: Sendable, Equatable {
     /// the panel shows the steering guide alone.
     public private(set) var codexModels: [String]
 
-    public static let defaults: [Int: String] = [
-        9: "Open PRs for all active GitButler branches",
-        12: "Run but pull",
-    ]
+    public static let defaults: [Int: String] = [:]
     public static let defaultClaudeModels = ["fable", "opus", "sonnet", "haiku"]
     public static let defaultClaudeEfforts = ["low", "medium", "high", "xhigh", "max"]
 
