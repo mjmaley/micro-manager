@@ -6,6 +6,7 @@ import WLKit
 struct MenuPanelView: View {
     @EnvironmentObject var bridge: BridgeController
     @ObservedObject private var notifications = AgentNotificationController.shared
+    @ObservedObject private var media = DictationMediaController.shared
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var inspectorError: String?
 
@@ -14,7 +15,11 @@ struct MenuPanelView: View {
             header
             Divider()
 
-            if bridge.permissionDenied {
+            if bridge.isRunning && bridge.secureInputPaused {
+                secureInputBanner
+                Divider()
+                agentSection
+            } else if bridge.permissionDenied {
                 permissionBanner
             } else if bridge.isRunning {
                 padSection
@@ -28,7 +33,7 @@ struct MenuPanelView: View {
                 idleHint
             }
 
-            if let error = bridge.lastError, !bridge.permissionDenied {
+            if let error = bridge.lastError, !bridge.permissionDenied, !bridge.secureInputPaused {
                 Divider()
                 Text(error)
                     .font(.caption)
@@ -37,7 +42,7 @@ struct MenuPanelView: View {
                     .padding(.horizontal, 14).padding(.vertical, 8)
             }
 
-            if bridge.contendingClient {
+            if bridge.contendingClient && !bridge.secureInputPaused {
                 Divider()
                 Label(
                     bridge.padConfiguration.isCodexMicro
@@ -86,11 +91,32 @@ struct MenuPanelView: View {
 
     private var subtitle: String {
         guard bridge.isRunning else { return "Off" }
+        if bridge.secureInputPaused { return "Paused by macOS Secure Input" }
         guard bridge.deviceConnected else { return "Looking for the pad…" }
+        if !bridge.hardwareInputReady { return "Validating device layer and keymap…" }
         var parts = [bridge.deviceName, bridge.firmware]
         if let battery = bridge.battery { parts.append(battery) }
         if let layer = bridge.activeLayerNumber { parts.append("Layer \(layer)") }
         return parts.joined(separator: " · ")
+    }
+
+    private var secureInputBanner: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("Paused by macOS Secure Input", systemImage: "lock.fill")
+                .font(.callout).foregroundStyle(.orange)
+            Text("macOS is protecting keyboard input. Hardware controls and lighting will recover automatically after protection clears. Agent navigation below remains available.")
+                .font(.caption).foregroundStyle(.secondary)
+            Text(bridge.secureInputApplication.map { "Reported association: \($0). This may be stale." }
+                 ?? "Associated application unknown or no longer running.")
+                .font(.caption).foregroundStyle(.secondary)
+            if let error = bridge.lastHIDError {
+                DisclosureGroup("Last HID write error") {
+                    Text(error).font(.caption2).textSelection(.enabled)
+                }.font(.caption)
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(.horizontal, 14).padding(.vertical, 10)
     }
 
     // MARK: - Pad
@@ -198,6 +224,7 @@ struct MenuPanelView: View {
                     .padding(.horizontal, 14).padding(.top, 6)
                 }
                 ForEach(Array(bridge.visibleAgents.enumerated()), id: \.offset) { index, agent in
+                    let lightState = bridge.lightingStateForVisibleSlot(index) ?? agent.status
                     Button {
                         Task { await bridge.focusSlot(index) }
                     } label: {
@@ -210,7 +237,7 @@ struct MenuPanelView: View {
                                 .foregroundStyle(.tertiary)
                             Text(agent.shortName).lineLimit(1)
                             Spacer(minLength: 8)
-                            Text(agent.status)
+                            Text(lightState == "done" ? "finished" : lightState == "idle" ? "idle / seen" : lightState)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -271,6 +298,47 @@ struct MenuPanelView: View {
 
     private var footer: some View {
         VStack(alignment: .leading, spacing: 0) {
+            Toggle("Pause media during dictation", isOn: Binding(
+                get: { media.enabled },
+                set: { media.setEnabled($0) }
+            ))
+            .toggleStyle(.checkbox)
+            .padding(.horizontal, 14).padding(.top, 8)
+            .help("Watches Codex/OpenWhispr input independently of the pad. Disable OpenWhispr’s own Pause media setting first. Turning this off leaves paused media paused.")
+
+            if media.enabled {
+                Text([media.status, media.inputStatus].filter { !$0.isEmpty }.joined(separator: "\n"))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 14).padding(.top, 3)
+                if !media.lastInputError.isEmpty {
+                    Text("Last mic read error: \(media.lastInputError)")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.horizontal, 14).padding(.top, 3)
+                }
+                Text("Turn off OpenWhispr’s own Pause media setting to avoid conflicts.")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 14).padding(.top, 3)
+                Button(media.checking ? "Checking…" : "Check media access") {
+                    Task { await media.checkMedia() }
+                }
+                .disabled(media.checking)
+                .font(.caption)
+                .padding(.horizontal, 14).padding(.top, 4)
+                if !media.diagnostic.isEmpty {
+                    Text(media.diagnostic)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.horizontal, 14).padding(.top, 3)
+                }
+            }
+
             Toggle("Agent notifications", isOn: Binding(
                 get: { notifications.enabled },
                 set: { on in Task { await notifications.setEnabled(on) } }

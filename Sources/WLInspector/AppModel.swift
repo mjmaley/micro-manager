@@ -80,7 +80,7 @@ final class AppModel: ObservableObject {
         device.onTX = { [weak self] method, params, id in
             self?.log(.tx, "\(method)  #\(id)", self?.encode(params) ?? "")
         }
-        device.onResponse = { [weak self] id, result, error in
+        device.onResponse = { [weak self] id, _, result, error in
             guard let self else { return }
             if let error {
                 self.log(.error, "response #\(id)", error)

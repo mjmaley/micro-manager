@@ -2,7 +2,7 @@ import XCTest
 import SwiftUI
 @testable import WLKit
 
-/// Mirrors test/status.test.js so the two implementations cannot drift.
+/// Base mapping/wire contracts, including this fork's completion/seen palette.
 final class StatusMapperTests: XCTestCase {
 
     private func agent(_ status: String, pane: String = "w1:p1") -> HerdrAgent {
@@ -52,7 +52,7 @@ final class StatusMapperTests: XCTestCase {
         XCTAssertEqual(threads.map(\.id), [1, 0, 2, 3, 4, 5], "keys in reading order")
         XCTAssertEqual(threads[0].color, 0xFFA000)
         XCTAssertEqual(threads[1].color, 0xFF2D2D)
-        XCTAssertEqual(threads[2].color, 0x00C853)
+        XCTAssertEqual(threads[2].color, 0xFFFFFF)
     }
 
     func testKeysWithNoAgentAreSwitchedOffNotLeftStale() {
@@ -135,16 +135,16 @@ final class StatusMapperTests: XCTestCase {
 extension StatusMapperTests {
 
     func testDoneAndIdleAreToldApartByColour() {
-        // "done" means finished and not yet looked at; "idle" means finished
-        // and seen. Different signals, so they must not share a colour.
+        // "done" includes unread completions and a viewed completion held
+        // green until focus leaves. Plain idle/acknowledged is white.
         let cfg = BridgeConfig()
         XCTAssertNotEqual(
             cfg.color(for: "done"),
             cfg.color(for: "idle"),
             "a finished-but-unread agent must be distinguishable from a quiet one"
         )
-        XCTAssertEqual(cfg.color(for: "idle"), 0x00C853)
-        XCTAssertEqual(cfg.color(for: "done"), 0x00B0FF)
+        XCTAssertEqual(cfg.color(for: "idle"), 0xFFFFFF)
+        XCTAssertEqual(cfg.color(for: "done"), 0x00C853)
     }
 
     func testAttentionStatesAllHaveDistinctColours() {
@@ -162,8 +162,8 @@ extension StatusMapperTests {
             HerdrAgent(status: "done", paneID: "w1:p1"),
             HerdrAgent(status: "idle", paneID: "w1:p2"),
         ])
-        XCTAssertEqual(threads[0].color, 0x00B0FF)
-        XCTAssertEqual(threads[1].color, 0x00C853)
+        XCTAssertEqual(threads[0].color, 0x00C853)
+        XCTAssertEqual(threads[1].color, 0xFFFFFF)
     }
 
     /// Pins every status colour. These are the whole point of the pad — a
@@ -173,8 +173,8 @@ extension StatusMapperTests {
         let cfg = BridgeConfig()
         XCTAssertEqual(cfg.color(for: "blocked"), 0xFF2D2D)
         XCTAssertEqual(cfg.color(for: "working"), 0xFFA000)
-        XCTAssertEqual(cfg.color(for: "done"), 0x00B0FF)
-        XCTAssertEqual(cfg.color(for: "idle"), 0x00C853)
-        XCTAssertEqual(cfg.color(for: "unknown"), 0x00C853)
+        XCTAssertEqual(cfg.color(for: "done"), 0x00C853)
+        XCTAssertEqual(cfg.color(for: "idle"), 0xFFFFFF)
+        XCTAssertEqual(cfg.color(for: "unknown"), 0x90A4AE)
     }
 }

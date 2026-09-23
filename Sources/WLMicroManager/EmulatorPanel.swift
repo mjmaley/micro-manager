@@ -65,8 +65,7 @@ struct EmulatorView: View {
 
     private var pad: some View {
         VStack(spacing: 8) {
-            // The ambient ring, which the bridge drives with the worst state
-            // across every agent.
+            // The ambient ring follows the selected Herdr agent's display state.
             RoundedRectangle(cornerRadius: 14)
                 .fill(zoneColor(emulator.ambientZone))
                 .frame(height: 8)

@@ -3,25 +3,22 @@ import SwiftUI
 
 /// Maps a set of Herdr agents to device lighting.
 ///
-/// Keys are individually addressable, so each agent gets its own key. The
-/// underglow keeps a worst-state-wins aggregate, which is the part you can read
-/// from across the room without counting keys.
-///
-/// Kept in step with `lib/status.js`; the defaults below are that file's.
+/// Each agent gets its own key. AgentLightingTracker supplies display-only
+/// done/idle states for unread/acknowledged completions; the bridge passes the
+/// selected agent's display state to the outer ring. The raw worst-state
+/// aggregate remains available for the menu-bar icon.
 public struct BridgeConfig: Sendable {
-    /// Highest priority first: the first state present across all agents wins
-    /// the underglow.
+    /// Highest priority first for the raw aggregate/menu-bar indicator.
+    /// The outer ring follows the selected agent instead.
     public var priority: [String] = ["blocked", "working", "unknown", "idle", "done"]
     public var colors: [String: Int] = [
         "blocked": 0xFF2D2D,
         "working": 0xFFA000,
-        // Herdr reports "done" for an agent that has finished and that you
-        // have not looked at yet, and "idle" once it is focused. That is a
-        // real difference - one is waiting to be read, the other is just
-        // quiet - so give them different colours.
-        "done": 0x00B0FF,
-        "idle": 0x00C853,
-        "unknown": 0x00C853,
+        // A completion stays green until viewed and then left. Plain idle
+        // or acknowledged completion is white, not perpetual finished-green.
+        "done": 0x00C853,
+        "idle": 0xFFFFFF,
+        "unknown": 0x90A4AE,
     ]
     public var effects: [String: OAI.Effect] = [
         "blocked": .breath,
@@ -83,13 +80,15 @@ public enum StatusMapper {
     public static func threads(
         for agents: [HerdrAgent],
         _ cfg: BridgeConfig = BridgeConfig(),
-        agentKeyIDs: [Int] = Pad.agentKeyIDs
+        agentKeyIDs: [Int] = Pad.agentKeyIDs,
+        lightingStates: [String]? = nil
     ) -> [OAI.Thread] {
         agentKeyIDs.enumerated().map { slot, id in
             guard slot < agents.count else {
                 return OAI.Thread(id: id, brightness: 0, effect: .off)
             }
-            let state = agents[slot].status
+            let state = lightingStates.flatMap { slot < $0.count ? $0[slot] : nil }
+                ?? agents[slot].status
             return OAI.Thread(
                 id: id,
                 color: cfg.color(for: state),
@@ -185,7 +184,7 @@ public enum StatusMapper {
         )
     }
 
-    /// The underglow zone for an aggregate state, or nil to switch it off.
+    /// The underglow zone for a display state, or nil to switch it off.
     public static func zone(for state: String?, _ cfg: BridgeConfig = BridgeConfig()) -> OAI.Zone? {
         guard let state else { return nil }
         return OAI.Zone(

@@ -232,7 +232,7 @@ struct WLLayerProbe {
             var foreignResponses = 0
             var issuedIDs = Set<Int>()
             device.onTX = { _, _, id in issuedIDs.insert(id) }
-            device.onResponse = { id, _, _ in
+            device.onResponse = { id, _, _, _ in
                 if issuedIDs.remove(id) == nil { foreignResponses += 1 }
             }
             device.onNotification = { method, params in

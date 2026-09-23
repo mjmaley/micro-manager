@@ -45,6 +45,7 @@ public final class WLDevice {
         case noVendorCollection
         case openFailed(IOReturn)
         case notConnected
+        case secureInputActive
         case writeFailed(IOReturn)
         case timeout(String)
         case rpc(String, String)
@@ -64,6 +65,8 @@ public final class WLDevice {
                 return String(format: "IOHIDDeviceOpen failed (0x%08X)", UInt32(bitPattern: r))
             case .notConnected:
                 return "Not connected."
+            case .secureInputActive:
+                return "Hardware access paused by macOS Secure Input."
             case .writeFailed(let r):
                 let code = UInt32(bitPattern: r)
                 let name: String
@@ -86,11 +89,12 @@ public final class WLDevice {
     }
 
     // Callbacks, always delivered on the main queue.
-    public var onTX: ((String, Any?, Int) -> Void)?          // method, params, id
-    public var onResponse: ((Int, Any?, String?) -> Void)?   // id, result, errorMessage
+    public var onTX: ((String, Any?, Int) -> Void)?          // queued method, params, id
+    public var onResponse: ((Int, String?, Any?, String?) -> Void)? // id, method, result, error
     public var onNotification: ((String, Any?) -> Void)?     // method, params
     public var onDeviceLog: ((String) -> Void)?
     public var onWriteError: ((String, String) -> Void)?
+    public var onSecureInputBlocked: (() -> Void)?
     /// Every input report, before framing. Reports that do not match the
     /// channel framing are otherwise dropped, which hides any other traffic
     /// the device emits - key presses included.
@@ -104,14 +108,17 @@ public final class WLDevice {
     private var emulatedConnected = false
     private var manager: IOHIDManager?
     private var device: IOHIDDevice?
+    private var connectionGeneration: UInt64 = 0
     private var inputBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: reportSize)
     private var rpcAccumulator = ""
     private var debugAccumulator = ""
     private struct PendingCall {
+        var token: UUID
         var method: String
         var completion: (Any?, String?) -> Void
     }
     private var pending: [Int: PendingCall] = [:]
+    private let writeQueue = HIDWriteQueue()
     // Multiple non-exclusive clients share replies. A randomized starting id
     // makes accidental collisions with Codex far less likely than every client
     // beginning at 1 and advancing in lockstep.
@@ -119,7 +126,18 @@ public final class WLDevice {
 
     public var isConnected: Bool { device != nil || emulatedConnected }
 
-    public init(emulator: PadEmulator? = nil) { self.emulator = emulator }
+    private let secureInputIsActive: () -> Bool
+
+    public init(emulator: PadEmulator? = nil) {
+        self.emulator = emulator
+        self.secureInputIsActive = { SecureInputStatus.isActive }
+    }
+
+    /// Tests can simulate the policy without changing macOS protection.
+    init(emulator: PadEmulator? = nil, secureInputIsActive: @escaping () -> Bool) {
+        self.emulator = emulator
+        self.secureInputIsActive = secureInputIsActive
+    }
 
     deinit { inputBuffer.deallocate() }
 
@@ -127,6 +145,10 @@ public final class WLDevice {
 
     public func connect() throws {
         disconnect(reason: nil)
+        if emulator == nil && secureInputIsActive() {
+            onSecureInputBlocked?()
+            throw Failure.secureInputActive
+        }
 
         if let emulator {
             emulatedConnected = true
@@ -187,20 +209,30 @@ public final class WLDevice {
         IOHIDDeviceRegisterInputReportCallback(dev, inputBuffer, WLDevice.reportSize, { ctx, _, _, _, reportID, report, length in
             guard let ctx, length > 0 else { return }
             let me = Unmanaged<WLDevice>.fromOpaque(ctx).takeUnretainedValue()
+            guard !me.secureInputIsActive() else { return }
+            let generation = me.connectionGeneration
             let bytes = Array(UnsafeBufferPointer(start: report, count: Int(length)))
-            DispatchQueue.main.async { me.handleReport(bytes, reportID: reportID) }
+            DispatchQueue.main.async {
+                guard generation == me.connectionGeneration, !me.secureInputIsActive() else { return }
+                me.handleReport(bytes, reportID: reportID)
+            }
         }, context)
 
         IOHIDDeviceRegisterRemovalCallback(dev, { ctx, _, _ in
             guard let ctx else { return }
             let me = Unmanaged<WLDevice>.fromOpaque(ctx).takeUnretainedValue()
-            DispatchQueue.main.async { me.disconnect(reason: "device removed") }
+            let generation = me.connectionGeneration
+            DispatchQueue.main.async {
+                guard generation == me.connectionGeneration else { return }
+                me.disconnect(reason: "device removed")
+            }
         }, context)
 
         IOHIDDeviceScheduleWithRunLoop(dev, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
     }
 
     public func disconnect(reason: String?) {
+        connectionGeneration &+= 1
         if emulator != nil {
             guard emulatedConnected else { return }
             emulatedConnected = false
@@ -212,6 +244,7 @@ public final class WLDevice {
             return
         }
         let hadTransport = device != nil || manager != nil
+        writeQueue.invalidateAndDrain()
         if let dev = device {
             IOHIDDeviceUnscheduleFromRunLoop(dev, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
             IOHIDDeviceClose(dev, IOOptionBits(kIOHIDOptionsTypeNone))
@@ -233,6 +266,22 @@ public final class WLDevice {
 
     @discardableResult
     public func call(_ method: String, params: Any?, completion: ((Any?, String?) -> Void)? = nil) -> Int? {
+        callImpl(method, params: params, queued: false, completion: completion)
+    }
+
+    /// Normal async traffic sends reports off-main. Request tables and all
+    /// callbacks stay on main, independently of slow USB/Bluetooth writes.
+    func callQueued(_ method: String, params: Any?, completion: @escaping (Any?, String?) -> Void) -> Int? {
+        callImpl(method, params: params, queued: true, completion: completion)
+    }
+
+    private func callImpl(_ method: String, params: Any?, queued: Bool,
+                          completion: ((Any?, String?) -> Void)?) -> Int? {
+        if emulator == nil && secureInputIsActive() {
+            onSecureInputBlocked?()
+            completion?(nil, Failure.secureInputActive.errorDescription)
+            return nil
+        }
         guard emulatedConnected || device != nil else {
             completion?(nil, Failure.notConnected.errorDescription)
             return nil
@@ -250,7 +299,7 @@ public final class WLDevice {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 let (result, error) = emulator.handle(method, params: params)
-                self.onResponse?(id, result, error)
+                self.onResponse?(id, method, result, error)
                 completion?(result, error)
             }
             return id
@@ -270,39 +319,82 @@ public final class WLDevice {
         }
 
         let payload = [UInt8](data)
-        var offset = 0
-        while offset < payload.count {
-            let n = min(WLDevice.maxChunk, payload.count - offset)
-            var report = [UInt8](repeating: 0, count: WLDevice.reportSize)
-            report[0] = WLDevice.reportID
-            report[1] = WLDevice.channelRPC
-            report[2] = UInt8(n)
-            report.replaceSubrange(3..<(3 + n), with: payload[offset..<(offset + n)])
-
-            let rc = report.withUnsafeBufferPointer { buf in
-                IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, CFIndex(WLDevice.reportID), buf.baseAddress!, buf.count)
-            }
-            guard rc == kIOReturnSuccess else {
-                // Surface the failure rather than dropping it: a silent write
-                // error is indistinguishable from a device that ignores you.
-                let message = Failure.writeFailed(rc).errorDescription ?? "write failed"
-                onWriteError?(method, message)
-                completion?(nil, message)
-                return nil
-            }
-            offset += n
-        }
-
-        onTX?(method, params, id)
-
+        let requestToken = UUID()
         if let completion {
-            pending[id] = PendingCall(method: method, completion: completion)
+            pending[id] = PendingCall(token: requestToken, method: method, completion: completion)
             DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
-                guard let self, let waiting = self.pending.removeValue(forKey: id) else { return }
+                guard let self, let waiting = self.pending[id], waiting.token == requestToken else { return }
+                self.pending.removeValue(forKey: id)
                 waiting.completion(nil, Failure.timeout(method).errorDescription)
             }
         }
+        onTX?(method, params, id)
+
+        let inputCheck = secureInputIsActive
+        if queued {
+            writeQueue.enqueue { [weak self, dev] generation in
+                let result = Self.writePayload(payload, to: dev, secureInput: inputCheck)
+                guard result != kIOReturnSuccess else { return }
+                DispatchQueue.main.async {
+                    guard let self, self.writeQueue.isCurrent(generation) else { return }
+                    if let result {
+                        self.reportWriteFailure(result, method: method, id: id, token: requestToken)
+                    } else {
+                        self.reportSecureInputBlock(id: id, token: requestToken)
+                    }
+                }
+            }
+            return id
+        }
+        let result = writeQueue.sync { Self.writePayload(payload, to: dev, secureInput: inputCheck) }
+        guard let result else {
+            reportSecureInputBlock(id: id, token: requestToken)
+            return nil
+        }
+        guard result == kIOReturnSuccess else {
+            reportWriteFailure(result, method: method, id: id, token: requestToken)
+            return nil
+        }
         return id
+    }
+
+    private func reportSecureInputBlock(id: Int, token: UUID) {
+        if let waiting = pending[id], waiting.token == token {
+            pending.removeValue(forKey: id)
+            waiting.completion(nil, Failure.secureInputActive.errorDescription)
+        }
+        onSecureInputBlocked?()
+    }
+
+    private func reportWriteFailure(_ code: IOReturn, method: String, id: Int, token: UUID) {
+        let message = Failure.writeFailed(code).errorDescription ?? "write failed"
+        if let waiting = pending[id], waiting.token == token {
+            pending.removeValue(forKey: id)
+            waiting.completion(nil, message)
+        }
+        onWriteError?(method, message)
+    }
+
+    /// Called only on writeQueue; never touches connection/request state.
+    private static func writePayload(_ payload: [UInt8], to dev: IOHIDDevice,
+                                     secureInput: () -> Bool) -> IOReturn? {
+        var offset = 0
+        while offset < payload.count {
+            // nil is a proactive policy pause, not a fabricated driver error.
+            guard !secureInput() else { return nil }
+            let n = min(maxChunk, payload.count - offset)
+            var report = [UInt8](repeating: 0, count: reportSize)
+            report[0] = reportID
+            report[1] = channelRPC
+            report[2] = UInt8(n)
+            report.replaceSubrange(3..<(3 + n), with: payload[offset..<(offset + n)])
+            let result = report.withUnsafeBufferPointer { buffer in
+                IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, CFIndex(reportID), buffer.baseAddress!, buffer.count)
+            }
+            guard result == kIOReturnSuccess else { return result }
+            offset += n
+        }
+        return kIOReturnSuccess
     }
 
     // MARK: - Receive
@@ -353,7 +445,7 @@ public final class WLDevice {
             if let id = decoded["id"] as? Int {
                 let error = (decoded["error"] as? [String: Any])?["message"] as? String
                 let result = decoded["result"]
-                onResponse?(id, result, error)
+                onResponse?(id, decoded["method"] as? String, result, error)
                 if let waiting = pending[id] {
                     // Responses normally echo the method. If another shared
                     // client happens to reuse our numeric id, do not resolve a

@@ -14,6 +14,8 @@ enum MenuBarIcon {
         case off
         case permissionDenied
         case deviceMissing
+        case secureInputPaused
+        case validating
         case idle            // running, no agents
         case allIdle
         case working
@@ -24,8 +26,10 @@ enum MenuBarIcon {
         @MainActor
         static func from(_ bridge: BridgeController) -> State {
             guard bridge.isRunning else { return .off }
+            if bridge.secureInputPaused { return .secureInputPaused }
             if bridge.permissionDenied { return .permissionDenied }
             if !bridge.deviceConnected { return .deviceMissing }
+            if !bridge.hardwareInputReady { return .validating }
             guard let state = bridge.aggregateState else { return .idle }
             switch state {
             case "blocked": return .blocked
@@ -37,6 +41,8 @@ enum MenuBarIcon {
         var symbolName: String {
             switch self {
             case .off: return "keyboard"
+            case .secureInputPaused: return "lock.fill"
+            case .validating: return "arrow.triangle.2.circlepath"
             case .permissionDenied, .deviceMissing: return "keyboard.badge.exclamationmark"
             case .idle: return "keyboard"
             case .allIdle, .working, .blocked: return "keyboard.fill"
@@ -48,7 +54,8 @@ enum MenuBarIcon {
             switch self {
             case .off, .idle: return nil
             case .permissionDenied: return .systemRed
-            case .deviceMissing: return .systemGray
+            case .deviceMissing, .validating: return .systemGray
+            case .secureInputPaused: return .systemOrange
             case .allIdle: return NSColor(srgbRed: 0, green: 0.78, blue: 0.33, alpha: 1)
             case .working: return NSColor(srgbRed: 1, green: 0.63, blue: 0, alpha: 1)
             case .blocked: return NSColor(srgbRed: 1, green: 0.18, blue: 0.18, alpha: 1)
@@ -60,6 +67,8 @@ enum MenuBarIcon {
             case .off: return "Micro Manager is off"
             case .permissionDenied: return "Input Monitoring permission is needed"
             case .deviceMissing: return "Pad not found"
+            case .secureInputPaused: return "Hardware paused by macOS Secure Input; recovery is automatic"
+            case .validating: return "Validating device layer and keymap before enabling hardware input"
             case .idle: return "Running — no agents"
             case .allIdle: return "All agents idle"
             case .working: return "An agent is working"

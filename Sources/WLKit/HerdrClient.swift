@@ -19,13 +19,11 @@ public struct HerdrAgent: Equatable, Sendable {
     public var foregroundCwd: String?
     public var focused: Bool
 
-    /// The target to hand to `agent.focus`, which resolves **pane ids only**:
-    /// a `terminal_id` comes back as `agent_not_found` (Herdr 0.7.5). Herdr
-    /// reports a terminal id for every agent, so preferring it here meant every
-    /// jump failed while the read-only paths — which never call `agent.focus` —
-    /// kept working. Terminal id stays as a fallback for a Herdr that omits
-    /// `pane_id`.
-    public var focusTarget: String? { paneID ?? terminalID }
+    /// Visible navigation requires the pane id, not the terminal/session id.
+    /// Do not guess a target when a server omits the pane identity.
+    public var focusTarget: String? {
+        paneID.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+    }
 
     /// Where the agent is actually working. `foreground_cwd` follows a `cd`
     /// inside the pane; `cwd` is only where the pane started.
@@ -201,8 +199,27 @@ public enum HerdrClient {
         try await listAgents().first(where: \.focused)
     }
 
-    public static func focusAgent(_ target: String) async throws {
-        _ = try await request("agent.focus", params: ["target": target])
+    /// Focus an agent by its pane identity. Herdr 0.9.0's `agent.focus`
+    /// updates server selection but omits client-shell navigation propagation;
+    /// `pane.focus` updates both, including the containing workspace and tab.
+    public static func focusAgent(_ paneID: String) async throws {
+        try await focusAgent(paneID, send: { method, params in
+            try await request(method, params: params)
+        })
+    }
+
+    /// Injectable request boundary for wire-contract regression tests.
+    static func focusAgent(
+        _ paneID: String,
+        send: (String, [String: Any]) async throws -> [String: Any]
+    ) async throws {
+        guard !paneID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw HerdrError.api("The agent has no pane identity to focus.")
+        }
+        let result = try await send("pane.focus", ["pane_id": paneID])
+        guard let pane = result["pane"] as? [String: Any], pane["pane_id"] as? String == paneID else {
+            throw HerdrError.badResponse("pane.focus did not acknowledge the requested pane \(paneID).")
+        }
     }
 
     public static func listTabs(workspaceID: String? = nil) async throws -> [HerdrTab] {

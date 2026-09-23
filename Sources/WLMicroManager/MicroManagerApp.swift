@@ -37,12 +37,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func becameInactive(for reason: InactivityReason) {
         let wasActive = inactivityReasons.isEmpty
         inactivityReasons.insert(reason)
-        if wasActive { bridge?.prepareForSystemInactivity() }
+        if wasActive {
+            DictationMediaController.shared.setSuspended(true)
+            bridge?.prepareForSystemInactivity()
+        }
     }
 
     private func becameActive(for reason: InactivityReason) {
         inactivityReasons.remove(reason)
-        if inactivityReasons.isEmpty { bridge?.resumeAfterSystemInactivity() }
+        if inactivityReasons.isEmpty {
+            bridge?.resumeAfterSystemInactivity()
+            DictationMediaController.shared.setSuspended(false)
+        }
     }
 
     @objc private func machineWillSleep(_ notification: Notification) { becameInactive(for: .systemSleep) }
@@ -94,6 +100,10 @@ struct MicroManagerApp: App {
         }
         voice.onError = { [weak bridge] message in bridge?.noteError(message) }
         bridge.onVoiceKey = { voice.handleVoiceKey() }
+
+        let media = DictationMediaController.shared
+        media.onRecordingChange = { active in voice.setObservedRecording(active) }
+        media.start()
 
         let tune = TuneController.shared
         tune.onError = { [weak bridge] message in bridge?.noteError(message) }

@@ -26,16 +26,28 @@ final class VoiceController {
     var onActiveChange: ((Bool) -> Void)?
     var onError: ((String) -> Void)?
 
-    /// Which half of the start/stop cycle we are in. Only the light cares —
-    /// stopping a take from the keyboard makes this drift, and the next press
-    /// resynchronises it.
+    /// Fallback estimate used only when microphone observation is disabled.
+    /// Keyboard/native-app start/stop can make this estimate drift.
     private var takeOpen = false
+    private var activityIsObserved = false
+
+    /// Actual input activity wins over button-count guessing when the optional
+    /// media feature is running. nil restores the legacy lighting behavior.
+    func setObservedRecording(_ active: Bool?) {
+        activityIsObserved = active != nil
+        let value = active ?? false
+        guard takeOpen != value else { return }
+        takeOpen = value
+        onActiveChange?(value)
+    }
 
     func handleVoiceKey() {
         do {
             try tapTriggerKey()
-            takeOpen.toggle()
-            onActiveChange?(takeOpen)
+            if !activityIsObserved {
+                takeOpen.toggle()
+                onActiveChange?(takeOpen)
+            }
         } catch {
             onError?(error.localizedDescription)
         }

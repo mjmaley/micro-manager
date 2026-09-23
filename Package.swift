@@ -9,6 +9,7 @@ let package = Package(
         .executable(name: "WLInspector", targets: ["WLInspector"]),
         .executable(name: "WLMicroManager", targets: ["WLMicroManager"]),
         .executable(name: "WLLayerProbe", targets: ["WLLayerProbe"]),
+        .executable(name: "WLMediaProbe", targets: ["WLMediaProbe"]),
     ],
     targets: [
         // Device transport, vendor protocol, Herdr client and the bridge engine.
@@ -23,6 +24,9 @@ let package = Package(
 
         // Safe diagnostic for validating AG lighting and input on non-Codex layers.
         .executableTarget(name: "WLLayerProbe", dependencies: ["WLKit"], path: "Sources/WLLayerProbe"),
+
+        // Read-only Now Playing + dictation input diagnostic; never controls media.
+        .executableTarget(name: "WLMediaProbe", dependencies: ["WLKit"], path: "Sources/WLMediaProbe"),
 
         // Fixtures are read from the source directory via #filePath rather than
         // from the test bundle, so they are excluded rather than declared as

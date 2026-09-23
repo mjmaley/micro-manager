@@ -1,0 +1,818 @@
+--- a/Sources/WLKit/BridgeController.swift
++++ b/Sources/WLKit/BridgeController.swift
+@@ -136,11 +136,6 @@
+     private var snapshotSequence = 0
+     private var lastFingerprint: String?
+     private var layerLighting = LayerLightingState()
+-    private var lightingCache = PadLightingCache()
+-    private var pendingLighting: PadLightingFrame?
+-    private var lightingTask: Task<Void, Never>?
+-    private var lightingWorkerGeneration: UInt64 = 0
+-    private var lastInputAt: TimeInterval = -.infinity
+     private var agentLightingTracker = AgentLightingTracker()
+     private var terminalActivationObserver: NSObjectProtocol?
+     private var lastPublishedFingerprint: String?
+@@ -185,7 +180,6 @@
+             self.hardwareInputReady = false
+             self.activeLayerNumber = nil
+             self.layerLighting.reset()
+-            self.resetLightingOutput()
+             self.lastFingerprint = nil
+             if self.isRunning { self.scheduleReopen() }
+         }
+@@ -200,23 +194,20 @@
+         device.onTX = { [weak self] _, _, id in
+             self?.issuedIDs.insert(id)
+         }
+-        device.onResponse = { [weak self] id, method, _, _ in
++        device.onResponse = { [weak self] id, _, _ in
+             guard let self else { return }
++            // A reply to an id we never sent came from another client. Its
++            // preceding request may have changed the global lighting, so let
++            // the next ordinary refresh repaint without hammering the device
++            // on every poll.
+             if self.issuedIDs.remove(id) == nil {
+                 self.contendingClient = true
+-                // Codex also queries battery/status. Those replies do not
+-                // justify a full repaint after every focus event.
+-                if self.lightingCache.invalidate(method: method) {
+-                    self.lastFingerprint = nil
+-                }
++                self.lastFingerprint = nil
+             }
+         }
+         device.onNotification = { [weak self] method, params in
+-            guard let self, !self.refreshSecureInput(), self.hardwareInputReady else { return }
+-            if method == OAI.notifyHID || method == OAI.notifyJoystick {
+-                self.lastInputAt = ProcessInfo.processInfo.systemUptime
+-            }
+-            guard method == OAI.notifyHID,
++            guard let self, !self.refreshSecureInput(), self.hardwareInputReady,
++                  method == OAI.notifyHID,
+                   let dict = params as? [String: Any],
+                   let action = dict["act"] as? Int,
+                   let index = OAI.agIndex(dict["k"] as? String)
+@@ -300,7 +291,6 @@
+         secureInputPaused = false
+         secureInputApplication = nil
+         layerLighting.reset()
+-        resetLightingOutput()
+         agentLightingTracker.reset()
+         stopFocusObservation()
+         snapshotSequence += 1
+@@ -352,7 +342,6 @@
+         hardwareInputReady = false
+         secureInputTask?.cancel(); secureInputTask = nil
+         layerLighting.reset()
+-        resetLightingOutput()
+         agentLightingTracker.endViewing()
+         stopFocusObservation()
+         snapshotSequence += 1
+@@ -550,10 +539,7 @@
+         }
+         let changed = previous != activeLayerNumber
+         let handoff = layerLighting.observe(activeLayerNumber, managedLayer: herdrLayerNumber)
+-        if changed {
+-            lastFingerprint = nil
+-            resetLightingOutput()
+-        }
++        if changed { lastFingerprint = nil }
+         if let handoff, padConfiguration.isCodexMicro {
+             await clearLightingForLayerHandoff(token: handoff)
+         }
+@@ -584,7 +570,6 @@
+         hardwareInputReady = false
+         activeLayerNumber = nil
+         layerLighting.reset()
+-        resetLightingOutput()
+         lastFingerprint = nil
+         statusFailureCount = 0
+         lastError = message
+@@ -653,7 +638,6 @@
+                 wideKeysDown.removeAll()
+                 lastSubmitPressAt = nil
+                 layerLighting.reset()
+-                resetLightingOutput()
+                 lastFingerprint = nil
+                 activeLayerNumber = nil
+                 keymapReady = false
+@@ -752,7 +736,6 @@
+     // MARK: - Repaint
+ 
+     public func forceRepaint() async {
+-        lightingCache.invalidate()
+         lastFingerprint = nil
+         await refresh(forcePaint: true)
+     }
+@@ -860,77 +843,27 @@
+     private func apply(state: String?, threads: [OAI.Thread]) async {
+         guard isRunning, deviceConnected, hardwareInputReady, !suspendedForSystemInactivity,
+               !refreshSecureInput(), isHerdrLayerActive else { return }
+-        let zone = StatusMapper.zone(for: state, config) ?? .dark
+-        pendingLighting = PadLightingFrame(threads: threads,
+-                                            keys: config.driveBacklight ? zone : .dark, ambient: zone)
+-        guard lightingTask == nil else { return } // Latest picture wins, no backlog.
+-        let worker = lightingWorkerGeneration
+-        lightingTask = Task { [weak self] in await self?.flushLighting(worker: worker) }
+-    }
+-
+-    private func resetLightingOutput() {
+-        lightingWorkerGeneration &+= 1
+-        lightingTask?.cancel()
+-        lightingTask = nil
+-        pendingLighting = nil
+-        lightingCache.invalidate()
+-    }
+-
+-    private func flushLighting(worker: UInt64) async {
+-        defer { if worker == lightingWorkerGeneration { lightingTask = nil } }
+-        while worker == lightingWorkerGeneration, !Task.isCancelled {
+-            guard isRunning, deviceConnected, hardwareInputReady, !suspendedForSystemInactivity,
+-              !refreshSecureInput(), isHerdrLayerActive else { return }
+-            guard pendingLighting != nil else { return }
+-            // Input takes precedence. Dial/joystick bursts coalesce into one
+-            // final render after 120 ms of quiet instead of a render per event.
+-            let quietRemaining = 0.12 - (ProcessInfo.processInfo.systemUptime - lastInputAt)
+-            if quietRemaining > 0 {
+-                do { try await Task.sleep(nanoseconds: UInt64(quietRemaining * 1_000_000_000)) }
+-                catch { return }
+-                continue
+-            }
+-            guard let frame = pendingLighting else { return }
+-            pendingLighting = nil
+-            let token = layerLighting.generation
+-            let delta = lightingCache.delta(for: frame)
+-            guard !delta.isEmpty else { continue }
+-            layerLighting.markPainting(managedLayer: herdrLayerNumber)
+-            func mayContinue() -> Bool {
+-                worker == lightingWorkerGeneration && !Task.isCancelled && isRunning
+-                    && deviceConnected && !suspendedForSystemInactivity
+-                    && layerLighting.mayPaint(token, managedLayer: herdrLayerNumber)
+-            }
+-            do {
+-                if !delta.threads.isEmpty {
+-                    let revision = lightingCache.revision
+-                    _ = try await device.callAsync(OAI.methodThreads, params: OAI.threadsParams(delta.threads))
+-                    guard mayContinue() else { return }
+-                    if lightingCache.revision == revision { lightingCache.recordThreads(delta.threads) }
+-                }
+-                guard mayContinue() else { return }
+-                // Do not finish an obsolete frame or continue lighting writes
+-                // through a new input burst. Already-sent JSON is never split.
+-                if pendingLighting != nil { continue }
+-                if ProcessInfo.processInfo.systemUptime - lastInputAt < 0.12 {
+-                    pendingLighting = frame
+-                    continue
+-                }
+-                if lightingCache.delta(for: frame).zonesChanged {
+-                    let revision = lightingCache.revision
+-                    _ = try await device.callAsync(OAI.methodRGBConfig,
+-                        params: OAI.rgbConfigParams(keys: frame.keys, ambient: frame.ambient))
+-                    guard mayContinue() else { return }
+-                    if lightingCache.revision == revision { lightingCache.recordZones(frame) }
+-                }
+-            } catch {
+-                guard mayContinue() else { return }
+-                lastError = error.localizedDescription
+-                lightingCache.invalidate()
+-                lastFingerprint = nil // Retry on the normal poll, not in a tight loop.
+-                pendingLighting = nil
+-                return
+-            }
++        let token = layerLighting.generation
++        // A sent request may reach the hardware even if its acknowledgement is
++        // lost, so claim ownership before sending rather than after the reply.
++        layerLighting.markPainting(managedLayer: herdrLayerNumber)
++        do {
++            _ = try await device.callAsync(OAI.methodThreads, params: OAI.threadsParams(threads))
++            // The layer can change while awaiting the first response. Never
++            // follow a departure clear with the old layer's ambient colour.
++            guard isRunning, deviceConnected, !suspendedForSystemInactivity,
++                  layerLighting.mayPaint(token, managedLayer: herdrLayerNumber) else { return }
++            let zone = StatusMapper.zone(for: state, config) ?? .dark
++            _ = try await device.callAsync(
++                OAI.methodRGBConfig,
++                params: OAI.rgbConfigParams(
++                    keys: config.driveBacklight ? zone : .dark,
++                    ambient: zone
++                )
++            )
++        } catch {
++            lastError = error.localizedDescription
++            lastFingerprint = nil   // repaint on the next tick
+         }
+     }
+ 
+@@ -987,7 +920,6 @@
+     /// Every bound key arrives here. Which key does what is the one place that
+     /// has to agree with `Pad`, so keep the dispatch in a single switch.
+     public func handleKeyPress(_ index: Int) {
+-        lastInputAt = ProcessInfo.processInfo.systemUptime
+         if onKeyIntercept?(index) == true { return }
+         if index == Pad.fastKeyID {
+             onFastKey?()
+@@ -1053,7 +985,7 @@
+     public func setVoiceActive(_ active: Bool) async {
+         guard voiceActive != active else { return }
+         voiceActive = active
+-        await refresh()
++        await forceRepaint()
+     }
+ 
+     /// Lets app-layer features that fail outside the bridge surface their
+@@ -1076,14 +1008,14 @@
+     public func setStackPanelOpen(_ open: Bool) async {
+         guard stackPanelOpen != open else { return }
+         stackPanelOpen = open
+-        await refresh()
++        await forceRepaint()
+     }
+ 
+     /// Repaints the land key. Same contract as `setStackPanelOpen`.
+     public func setLandPanelOpen(_ open: Bool) async {
+         guard landPanelOpen != open else { return }
+         landPanelOpen = open
+-        await refresh()
++        await forceRepaint()
+     }
+ 
+     /// Move the six-agent bank shown on the pad. Joystick east/right advances
+@@ -1094,7 +1026,7 @@
+         lastFingerprint = nil
+         Task { [weak self] in
+             guard let self else { return }
+-            await self.refresh()
++            await self.forceRepaint()
+         }
+     }
+ 
+@@ -1107,7 +1039,7 @@
+         do {
+             try await HerdrClient.focusAgent(target)
+             raiseTerminal()
+-            if isRunning { await refresh() }
++            if isRunning { await forceRepaint() }
+         } catch {
+             lastError = error.localizedDescription
+         }
+@@ -1129,7 +1061,7 @@
+         try await HerdrClient.focusAgent(target.paneID)
+         agentPage = index / agentPageSize
+         raiseTerminal()
+-        if isRunning { await refresh() }
++        if isRunning { await forceRepaint() }
+     }
+ 
+     public static var terminalBundleID: String {
+--- a/Sources/WLKit/WLDevice.swift
++++ b/Sources/WLKit/WLDevice.swift
+@@ -89,8 +89,8 @@
+     }
+ 
+     // Callbacks, always delivered on the main queue.
+-    public var onTX: ((String, Any?, Int) -> Void)?          // queued method, params, id
+-    public var onResponse: ((Int, String?, Any?, String?) -> Void)? // id, method, result, error
++    public var onTX: ((String, Any?, Int) -> Void)?          // method, params, id
++    public var onResponse: ((Int, Any?, String?) -> Void)?   // id, result, errorMessage
+     public var onNotification: ((String, Any?) -> Void)?     // method, params
+     public var onDeviceLog: ((String) -> Void)?
+     public var onWriteError: ((String, String) -> Void)?
+@@ -113,12 +113,10 @@
+     private var rpcAccumulator = ""
+     private var debugAccumulator = ""
+     private struct PendingCall {
+-        var token: UUID
+         var method: String
+         var completion: (Any?, String?) -> Void
+     }
+     private var pending: [Int: PendingCall] = [:]
+-    private let writeQueue = HIDWriteQueue()
+     // Multiple non-exclusive clients share replies. A randomized starting id
+     // makes accidental collisions with Codex far less likely than every client
+     // beginning at 1 and advancing in lockstep.
+@@ -244,7 +242,6 @@
+             return
+         }
+         let hadTransport = device != nil || manager != nil
+-        writeQueue.invalidateAndDrain()
+         if let dev = device {
+             IOHIDDeviceUnscheduleFromRunLoop(dev, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+             IOHIDDeviceClose(dev, IOOptionBits(kIOHIDOptionsTypeNone))
+@@ -266,17 +263,6 @@
+ 
+     @discardableResult
+     public func call(_ method: String, params: Any?, completion: ((Any?, String?) -> Void)? = nil) -> Int? {
+-        callImpl(method, params: params, queued: false, completion: completion)
+-    }
+-
+-    /// Normal async traffic sends reports off-main. Request tables and all
+-    /// callbacks stay on main, independently of slow USB/Bluetooth writes.
+-    func callQueued(_ method: String, params: Any?, completion: @escaping (Any?, String?) -> Void) -> Int? {
+-        callImpl(method, params: params, queued: true, completion: completion)
+-    }
+-
+-    private func callImpl(_ method: String, params: Any?, queued: Bool,
+-                          completion: ((Any?, String?) -> Void)?) -> Int? {
+         if emulator == nil && secureInputIsActive() {
+             onSecureInputBlocked?()
+             completion?(nil, Failure.secureInputActive.errorDescription)
+@@ -299,7 +285,7 @@
+             DispatchQueue.main.async { [weak self] in
+                 guard let self else { return }
+                 let (result, error) = emulator.handle(method, params: params)
+-                self.onResponse?(id, method, result, error)
++                self.onResponse?(id, result, error)
+                 completion?(result, error)
+             }
+             return id
+@@ -319,82 +305,44 @@
+         }
+ 
+         let payload = [UInt8](data)
+-        let requestToken = UUID()
+-        if let completion {
+-            pending[id] = PendingCall(token: requestToken, method: method, completion: completion)
+-            DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+-                guard let self, let waiting = self.pending[id], waiting.token == requestToken else { return }
+-                self.pending.removeValue(forKey: id)
+-                waiting.completion(nil, Failure.timeout(method).errorDescription)
+-            }
+-        }
+-        onTX?(method, params, id)
+-
+-        let inputCheck = secureInputIsActive
+-        if queued {
+-            writeQueue.enqueue { [weak self, dev] generation in
+-                let result = Self.writePayload(payload, to: dev, secureInput: inputCheck)
+-                guard result != kIOReturnSuccess else { return }
+-                DispatchQueue.main.async {
+-                    guard let self, self.writeQueue.isCurrent(generation) else { return }
+-                    if let result {
+-                        self.reportWriteFailure(result, method: method, id: id, token: requestToken)
+-                    } else {
+-                        self.reportSecureInputBlock(id: id, token: requestToken)
+-                    }
+-                }
+-            }
+-            return id
+-        }
+-        let result = writeQueue.sync { Self.writePayload(payload, to: dev, secureInput: inputCheck) }
+-        guard let result else {
+-            reportSecureInputBlock(id: id, token: requestToken)
+-            return nil
+-        }
+-        guard result == kIOReturnSuccess else {
+-            reportWriteFailure(result, method: method, id: id, token: requestToken)
+-            return nil
+-        }
+-        return id
+-    }
+-
+-    private func reportSecureInputBlock(id: Int, token: UUID) {
+-        if let waiting = pending[id], waiting.token == token {
+-            pending.removeValue(forKey: id)
+-            waiting.completion(nil, Failure.secureInputActive.errorDescription)
+-        }
+-        onSecureInputBlocked?()
+-    }
+-
+-    private func reportWriteFailure(_ code: IOReturn, method: String, id: Int, token: UUID) {
+-        let message = Failure.writeFailed(code).errorDescription ?? "write failed"
+-        if let waiting = pending[id], waiting.token == token {
+-            pending.removeValue(forKey: id)
+-            waiting.completion(nil, message)
+-        }
+-        onWriteError?(method, message)
+-    }
+-
+-    /// Called only on writeQueue; never touches connection/request state.
+-    private static func writePayload(_ payload: [UInt8], to dev: IOHIDDevice,
+-                                     secureInput: () -> Bool) -> IOReturn? {
+         var offset = 0
+         while offset < payload.count {
+-            // nil is a proactive policy pause, not a fabricated driver error.
+-            guard !secureInput() else { return nil }
+-            let n = min(maxChunk, payload.count - offset)
+-            var report = [UInt8](repeating: 0, count: reportSize)
+-            report[0] = reportID
+-            report[1] = channelRPC
++            if secureInputIsActive() {
++                onSecureInputBlocked?()
++                completion?(nil, Failure.secureInputActive.errorDescription)
++                return nil
++            }
++            let n = min(WLDevice.maxChunk, payload.count - offset)
++            var report = [UInt8](repeating: 0, count: WLDevice.reportSize)
++            report[0] = WLDevice.reportID
++            report[1] = WLDevice.channelRPC
+             report[2] = UInt8(n)
+             report.replaceSubrange(3..<(3 + n), with: payload[offset..<(offset + n)])
+-            let result = report.withUnsafeBufferPointer { buffer in
+-                IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, CFIndex(reportID), buffer.baseAddress!, buffer.count)
+-            }
+-            guard result == kIOReturnSuccess else { return result }
++
++            let rc = report.withUnsafeBufferPointer { buf in
++                IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, CFIndex(WLDevice.reportID), buf.baseAddress!, buf.count)
++            }
++            guard rc == kIOReturnSuccess else {
++                // Surface the failure rather than dropping it: a silent write
++                // error is indistinguishable from a device that ignores you.
++                let message = Failure.writeFailed(rc).errorDescription ?? "write failed"
++                onWriteError?(method, message)
++                completion?(nil, message)
++                return nil
++            }
+             offset += n
+         }
+-        return kIOReturnSuccess
++
++        onTX?(method, params, id)
++
++        if let completion {
++            pending[id] = PendingCall(method: method, completion: completion)
++            DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
++                guard let self, let waiting = self.pending.removeValue(forKey: id) else { return }
++                waiting.completion(nil, Failure.timeout(method).errorDescription)
++            }
++        }
++        return id
+     }
+ 
+     // MARK: - Receive
+@@ -445,7 +393,7 @@
+             if let id = decoded["id"] as? Int {
+                 let error = (decoded["error"] as? [String: Any])?["message"] as? String
+                 let result = decoded["result"]
+-                onResponse?(id, decoded["method"] as? String, result, error)
++                onResponse?(id, result, error)
+                 if let waiting = pending[id] {
+                     // Responses normally echo the method. If another shared
+                     // client happens to reuse our numeric id, do not resolve a
+--- a/Sources/WLKit/WLDevice+Async.swift
++++ b/Sources/WLKit/WLDevice+Async.swift
+@@ -1,9 +1,12 @@
+ import Foundation
+ 
+ extension WLDevice {
+-    /// Async request bookkeeping lives on main alongside input callbacks;
+-    /// actual report writes run on the device's serial background write queue.
+-    /// Slow lighting writes therefore cannot block handling a button or dial.
++    /// async/await over the completion-based `call`.
++    ///
++    /// Hops to the main queue first: `call` touches the pending-request table
++    /// and schedules its timeout there, and input reports are delivered there
++    /// too, so keeping every access on one queue is what makes the table safe
++    /// without locking.
+     public func callAsync(_ method: String, params: Any? = nil) async throws -> Any? {
+         try await withCheckedThrowingContinuation { continuation in
+             var resumed = false
+@@ -13,7 +16,7 @@
+                 continuation.resume(with: result)
+             }
+             DispatchQueue.main.async {
+-                let sent = self.callQueued(method, params: params) { result, error in
++                let sent = self.call(method, params: params) { result, error in
+                     if let error {
+                         finish(.failure(WLDevice.Failure.rpc(method, error)))
+                     } else {
+@@ -21,8 +24,8 @@
+                     }
+                 }
+                 if sent == nil {
+-                    // A request can be refused before queueing; the completion
+-                    // already carried the
++                    // `call` refuses before sending when there is no device or
++                    // the write fails; the completion already carried the
+                     // reason, so this only covers the silent case.
+                     finish(.failure(WLDevice.Failure.notConnected))
+                 }
+--- a/Sources/WLInspector/AppModel.swift
++++ b/Sources/WLInspector/AppModel.swift
+@@ -80,7 +80,7 @@
+         device.onTX = { [weak self] method, params, id in
+             self?.log(.tx, "\(method)  #\(id)", self?.encode(params) ?? "")
+         }
+-        device.onResponse = { [weak self] id, _, result, error in
++        device.onResponse = { [weak self] id, result, error in
+             guard let self else { return }
+             if let error {
+                 self.log(.error, "response #\(id)", error)
+--- a/Sources/WLLayerProbe/main.swift
++++ b/Sources/WLLayerProbe/main.swift
+@@ -232,7 +232,7 @@
+             var foreignResponses = 0
+             var issuedIDs = Set<Int>()
+             device.onTX = { _, _, id in issuedIDs.insert(id) }
+-            device.onResponse = { id, _, _, _ in
++            device.onResponse = { id, _, _ in
+                 if issuedIDs.remove(id) == nil { foreignResponses += 1 }
+             }
+             device.onNotification = { method, params in
+--- a/Sources/WLKit/HIDWriteQueue.swift
++++ /dev/null
+@@ -1,38 +0,0 @@
+-import Foundation
+-
+-/// Serialize complete RPC messages off the input/UI queue. Individual messages
+-/// must not interleave their HID fragments. Connection invalidation skips queued
+-/// messages and drains the current one before its IOHIDDevice is closed.
+-/// The only shared mutable state is generation, protected by lock.
+-final class HIDWriteQueue: @unchecked Sendable {
+-    private let queue = DispatchQueue(label: "cc.worklouder.hid-writes", qos: .userInitiated)
+-    private let lock = NSLock()
+-    private var generation: UInt64 = 0
+-
+-    func isCurrent(_ token: UInt64) -> Bool {
+-        lock.lock(); defer { lock.unlock() }
+-        return token == generation
+-    }
+-
+-    func enqueue(_ operation: @escaping (UInt64) -> Void) {
+-        lock.lock(); let token = generation; lock.unlock()
+-        queue.async(execute: DispatchWorkItem { [self] in
+-            guard isCurrent(token) else { return }
+-            operation(token)
+-        })
+-    }
+-
+-    /// Reserved for existing synchronous callers, notably sleep/off flushing.
+-    func sync<T>(_ operation: () -> T) -> T {
+-        dispatchPrecondition(condition: .notOnQueue(queue))
+-        return queue.sync(execute: operation)
+-    }
+-
+-    func invalidateAndDrain() {
+-        dispatchPrecondition(condition: .notOnQueue(queue))
+-        lock.lock(); generation &+= 1; lock.unlock()
+-        // A running write never waits on the main queue. Finish its complete
+-        // message before closing the transport; never cut a JSON frame in half.
+-        queue.sync {}
+-    }
+-}
+--- a/Sources/WLKit/PadLightingCache.swift
++++ /dev/null
+@@ -1,48 +0,0 @@
+-struct PadLightingFrame: Equatable {
+-    var threads: [OAI.Thread]
+-    var keys: OAI.Zone
+-    var ambient: OAI.Zone
+-}
+-
+-/// Cache only acknowledged writes, independently for keys and zones. A focus
+-/// change that changes only the ring must not resend every per-key RPC fragment.
+-struct PadLightingCache {
+-    struct Delta {
+-        var threads: [OAI.Thread]
+-        var zonesChanged: Bool
+-        var isEmpty: Bool { threads.isEmpty && !zonesChanged }
+-    }
+-
+-    private var threads: [Int: OAI.Thread] = [:]
+-    private var keys: OAI.Zone?
+-    private var ambient: OAI.Zone?
+-    private(set) var revision: UInt64 = 0
+-
+-    func delta(for frame: PadLightingFrame) -> Delta {
+-        Delta(threads: frame.threads.filter { threads[$0.id] != $0 },
+-              zonesChanged: keys != frame.keys || ambient != frame.ambient)
+-    }
+-
+-    mutating func recordThreads(_ written: [OAI.Thread]) {
+-        for thread in written { threads[thread.id] = thread }
+-    }
+-
+-    mutating func recordZones(_ frame: PadLightingFrame) {
+-        keys = frame.keys
+-        ambient = frame.ambient
+-    }
+-
+-    /// Returns whether this response could represent an external lighting write.
+-    /// Read-only status/version responses do not invalidate the rendered picture.
+-    @discardableResult
+-    mutating func invalidate(method: String? = nil) -> Bool {
+-        switch method {
+-        case OAI.methodThreads: threads.removeAll()
+-        case OAI.methodRGBConfig: keys = nil; ambient = nil
+-        case nil, OAI.methodPreview: threads.removeAll(); keys = nil; ambient = nil
+-        default: return false
+-        }
+-        revision &+= 1
+-        return true
+-    }
+-}
+--- a/Tests/WLKitTests/InputResponsivenessTests.swift
++++ /dev/null
+@@ -1,185 +0,0 @@
+-import Foundation
+-import Testing
+-@testable import WLKit
+-
+-struct InputResponsivenessTests {
+-    final class Events: @unchecked Sendable {
+-        private let lock = NSLock()
+-        private var storage: [String] = []
+-        func add(_ value: String) { lock.lock(); storage.append(value); lock.unlock() }
+-        var values: [String] { lock.lock(); defer { lock.unlock() }; return storage }
+-    }
+-
+-    @Test func blockedWriterDoesNotBlockMainQueueInput() async {
+-        let writer = HIDWriteQueue()
+-        let events = Events()
+-        let release = DispatchSemaphore(value: 0)
+-        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+-            writer.enqueue { _ in
+-                events.add(Thread.isMainThread ? "write-on-main" : "background-write")
+-                DispatchQueue.main.async {
+-                    events.add("input-delivered")
+-                    release.signal()
+-                }
+-                events.add(release.wait(timeout: .now() + 2) == .success ? "write-finished" : "input-starved")
+-                done.resume()
+-            }
+-        }
+-        #expect(events.values == ["background-write", "input-delivered", "write-finished"])
+-    }
+-
+-    @Test func wholeMessagesRemainSerialized() async {
+-        let writer = HIDWriteQueue()
+-        let events = Events()
+-        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+-            writer.enqueue { _ in
+-                events.add("a1")
+-                Thread.sleep(forTimeInterval: 0.01)
+-                events.add("a2")
+-            }
+-            writer.enqueue { _ in
+-                events.add("b1")
+-                Thread.sleep(forTimeInterval: 0.01)
+-                events.add("b2")
+-                done.resume()
+-            }
+-        }
+-        #expect(events.values == ["a1", "a2", "b1", "b2"])
+-    }
+-
+-    @Test func disconnectSkipsQueuedMessagesButFinishesCurrentMessage() async {
+-        let writer = HIDWriteQueue()
+-        let events = Events()
+-        let release = DispatchSemaphore(value: 0)
+-        let token: UInt64 = await withCheckedContinuation { started in
+-            writer.enqueue { token in
+-                events.add("started")
+-                started.resume(returning: token)
+-                _ = release.wait(timeout: .now() + 3)
+-                events.add("finished")
+-            }
+-        }
+-        writer.enqueue { _ in events.add("stale-message") }
+-        let drain = Task.detached { writer.invalidateAndDrain() }
+-        let deadline = Date().addingTimeInterval(2)
+-        while writer.isCurrent(token), Date() < deadline {
+-            try? await Task.sleep(nanoseconds: 1_000_000)
+-        }
+-        #expect(!writer.isCurrent(token))
+-        release.signal()
+-        await drain.value
+-        #expect(events.values == ["started", "finished"])
+-        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+-            writer.enqueue { next in
+-                events.add(next == token ? "old-connection" : "new-connection")
+-                done.resume()
+-            }
+-        }
+-        #expect(events.values.last == "new-connection")
+-    }
+-
+-    @Test func synchronousShutdownWriteCannotInterleaveAQueuedMessage() {
+-        let writer = HIDWriteQueue()
+-        let events = Events()
+-        writer.enqueue { _ in
+-            events.add("async1")
+-            Thread.sleep(forTimeInterval: 0.01)
+-            events.add("async2")
+-        }
+-        writer.sync { events.add("shutdown") }
+-        #expect(events.values == ["async1", "async2", "shutdown"])
+-    }
+-
+-    func frame() -> PadLightingFrame {
+-        PadLightingFrame(threads: (0..<13).map { OAI.Thread(id: $0, color: 0xFFFFFF, brightness: 1, effect: .solid) },
+-                         keys: .dark, ambient: OAI.Zone(color: 0xFFFFFF))
+-    }
+-
+-    func primed(_ frame: PadLightingFrame) -> PadLightingCache {
+-        var cache = PadLightingCache()
+-        cache.recordThreads(frame.threads)
+-        cache.recordZones(frame)
+-        return cache
+-    }
+-
+-    @Test func identicalPictureProducesNoWrites() {
+-        let picture = frame()
+-        #expect(primed(picture).delta(for: picture).isEmpty)
+-    }
+-
+-    @Test func ringChangeDoesNotResendAnyAgentKeys() {
+-        let original = frame()
+-        let cache = primed(original)
+-        var updated = original
+-        updated.ambient.color = 0xFFA000
+-        let delta = cache.delta(for: updated)
+-        #expect(delta.threads.isEmpty)
+-        #expect(delta.zonesChanged)
+-    }
+-
+-    @Test func oneAgentChangeSendsOnlyThatKeyWithoutZones() throws {
+-        let original = frame()
+-        let cache = primed(original)
+-        var updated = original
+-        updated.threads[3].color = 0x00C853
+-        let delta = cache.delta(for: updated)
+-        #expect(delta.threads.map(\.id) == [3])
+-        #expect(!delta.zonesChanged)
+-        let full = try JSONSerialization.data(withJSONObject: OAI.threadsParams(updated.threads))
+-        let small = try JSONSerialization.data(withJSONObject: OAI.threadsParams(delta.threads))
+-        #expect(small.count < full.count / 3)
+-    }
+-
+-    @Test func unusedKeyStillGetsExplicitOffUpdate() {
+-        let original = frame()
+-        let cache = primed(original)
+-        var updated = original
+-        updated.threads[5] = OAI.Thread(id: 5, brightness: 0, effect: .off)
+-        let delta = cache.delta(for: updated)
+-        #expect(delta.threads.count == 1)
+-        #expect(delta.threads.first?.effect == .off)
+-    }
+-
+-    @Test func foreignReadOnlyResponsesDoNotInvalidateLights() {
+-        let picture = frame()
+-        var cache = primed(picture)
+-        let revision = cache.revision
+-        for method in ["device.status", "sys.version", "config.read"] {
+-            let invalidated = cache.invalidate(method: method)
+-            #expect(!invalidated)
+-        }
+-        #expect(cache.revision == revision)
+-        #expect(cache.delta(for: picture).isEmpty)
+-    }
+-
+-    @Test func foreignWritesInvalidateOnlyTheirLightingSurface() {
+-        let picture = frame()
+-        var keys = primed(picture)
+-        let keysInvalidated = keys.invalidate(method: OAI.methodThreads)
+-        #expect(keysInvalidated)
+-        #expect(keys.delta(for: picture).threads.count == 13)
+-        #expect(!keys.delta(for: picture).zonesChanged)
+-        var zones = primed(picture)
+-        let zonesInvalidated = zones.invalidate(method: OAI.methodRGBConfig)
+-        #expect(zonesInvalidated)
+-        #expect(zones.delta(for: picture).threads.isEmpty)
+-        #expect(zones.delta(for: picture).zonesChanged)
+-    }
+-
+-    @Test func reconnectOrUnknownForeignWriteRequiresFullRefresh() {
+-        let picture = frame()
+-        var cache = primed(picture)
+-        let invalidated = cache.invalidate()
+-        #expect(invalidated)
+-        #expect(cache.delta(for: picture).threads.count == 13)
+-        #expect(cache.delta(for: picture).zonesChanged)
+-    }
+-
+-    @Test func partialAcknowledgementDoesNotClaimUnsentZones() {
+-        let picture = frame()
+-        var cache = PadLightingCache()
+-        cache.recordThreads(picture.threads)
+-        #expect(cache.delta(for: picture).threads.isEmpty)
+-        #expect(cache.delta(for: picture).zonesChanged)
+-    }
+-}
+--- a/README.md
++++ b/README.md
+@@ -380,16 +380,6 @@
+ the physical switch and another client's writes are not atomic with our poll.
+ No keypresses, app activation, or keymap writes are used for the clear.
+ 
+-**Deferred latency experiment (not installed).** Normal RPC report writes run on a serial
+-background queue, keeping the main queue available for button/dial input. Each
+-JSON message stays contiguous on the wire. Lighting keeps only the latest pending
+-picture and waits for 120 ms of input quiet before painting; the resulting small
+-lighting delay is intentional. Only changed keys/zones are sent, so changing the
+-ring does not resend all keys. Another client's read-only status replies do not
+-invalidate lighting. Reconnects and explicit Refresh still restore a full picture.
+-Synchronous off/sleep flushing remains serialized with queued writes, and a
+-transport is not closed until its current message finishes.
+-
+ **Known limitation:** Codex itself does not check the layer for `AG00`–`AG05`.
+ Double-pressing one of those keys can still bring Codex forward, even on Layer 2.
+ The current mapping intentionally retains those codes; shared HID access cannot
+@@ -405,7 +395,6 @@
+ ./scripts/test-swift-suite.sh AgentLightingTests
+ ./scripts/test-swift-suite.sh HerdrFocusTests
+ ./scripts/test-swift-suite.sh SecureInputTests
+-./scripts/test-swift-suite.sh InputResponsivenessTests
+ ./scripts/test-dictation-media.sh
+ swift run WLInspector  # the debug UI
+ ./scripts/bundle.sh    # assemble build/MicroManager.app, unsigned install
