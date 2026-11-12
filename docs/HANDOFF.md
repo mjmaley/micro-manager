@@ -167,6 +167,22 @@ blocked/completed states, focus acknowledgement, page changes, and layer handoff
 
 ## Latest live state and incidents
 
+### November 12: agent keys lag 3–5 s over Bluetooth LE
+
+After the herdr-core install the user reported agent-key presses taking about
+3–5 s, or about three presses, to switch agents; other inputs not yet tested.
+The pad is a Codex Micro on **Bluetooth LE** (it was on USB on September 29).
+The Herdr side is fast: `terminal.get` ~30 ms and `herdr-app do agent.focus`
+~25 ms. A 90 s, 1 ms `sample` of the installed app while the user pressed
+agent keys showed the **main thread inside synchronous `IOHIDDeviceSetReport`
+for 19.5 s of ~52 s sampled** (via `WLDevice.callAsync` → `WLDevice.call`).
+HID input is delivered on that main run loop, and AG00–AG05 also wait for a
+`device.status` round trip before dispatch, so presses queue behind blocking
+BLE writes (layer polling every 1.25 s plus full lighting repaints). This is
+the problem the deferred `HIDWriteQueue`/`PadLightingCache` work targets; it is
+not caused by the Herdr adapter. Not yet established: per-call SetReport
+duration, whether any press was dropped rather than delayed, and USB behavior.
+
 ### November 12: Herdr moved to herdr-core + Herdr app
 
 Read-only survey. The user now runs `herdr-core`/`hc` 0.1.20 (from
