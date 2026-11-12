@@ -38,8 +38,10 @@ includes `HIDWriteQueue`, `PadLightingCache`, background writes, latest-wins
 lighting, changed-key/zone writes, 120 ms input-quiet coalescing, and the
 agent-key raise fix. Installation: verified the old PID's exact path, SIGTERM,
 `ditto`, `open`; one copy running; its log reported "Hardware input ready;
-fresh layer/keymap validated layer=2". Physical lag, raise behavior, and Secure
-Input interplay of the background writer are being validated with the user.
+fresh layer/keymap validated layer=2". The user confirmed agent-key latency and
+Herdr raise over Bluetooth LE at 17:22. Still unvalidated for this build: Secure
+Input pause/recovery with the background writer, other inputs (Submit, dial,
+joystick, row 3, macros), and lighting under sustained status changes.
 Secure Input alone can explain `kIOReturnNotPermitted`; the earlier write-queue
 experiment was not proven to cause that error.
 
@@ -198,6 +200,14 @@ checks the frontmost app after 250 ms, falls back to LaunchServices
 under `HerdrFocus`. A test process launched from a Herdr terminal could raise
 Herdr with `activate()` alone, which does not establish MicroManager's case;
 check `log show --predicate 'category == "HerdrFocus"'` after a real press.
+
+**Validated 17:22 with the full branch build:** the user reported agent keys
+"much better" and Herdr taking focus back correctly from another app. The
+`HerdrFocus` log shows five presses, each "Raised dev.herdr.app via activate":
+the LaunchServices fallback never ran. So the earlier failure to come forward
+was most likely the same main-thread blocking (the request delayed or the press
+lost), not a declined activation. The fallback stays as a checked, logged guard.
+No errors were logged by the new process.
 
 ### November 12: Herdr moved to herdr-core + Herdr app
 
