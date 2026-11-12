@@ -290,15 +290,15 @@ index d9b2f0c..bd6e522 100644
          }
      }
  
-@@ -1029,7 +961,7 @@ public final class BridgeController: ObservableObject {
+@@ -1030,7 +962,7 @@ public final class BridgeController: ObservableObject {
          do {
              try await HerdrClient.focusAgent(target)
              raiseTerminal()
 -            if isRunning { await refresh() }
 +            if isRunning { await forceRepaint() }
          } catch {
+             focusLogger.error("Agent key focus failed: \(error.localizedDescription, privacy: .public)")
              lastError = error.localizedDescription
-         }
 @@ -1045,7 +977,7 @@ public final class BridgeController: ObservableObject {
          try await HerdrClient.focusAgent(target)
          agentPage = index / agentPageSize

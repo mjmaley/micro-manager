@@ -118,6 +118,7 @@ public final class BridgeController: ObservableObject {
     private var reopenSequence: UInt64 = 0
     private var ownerCheckAt = Date.distantPast
     private let inputLogger = Logger(subsystem: "cc.worklouder.micromanager", category: "HardwareInput")
+    private let focusLogger = Logger(subsystem: "cc.worklouder.micromanager", category: "HerdrFocus")
     private var snapshotSequence = 0
     private var lastFingerprint: String?
     private var layerLighting = LayerLightingState()
@@ -1031,6 +1032,7 @@ public final class BridgeController: ObservableObject {
             raiseTerminal()
             if isRunning { await refresh() }
         } catch {
+            focusLogger.error("Agent key focus failed: \(error.localizedDescription, privacy: .public)")
             lastError = error.localizedDescription
         }
     }
@@ -1066,18 +1068,43 @@ public final class BridgeController: ObservableObject {
     /// Nothing is ever launched: the agent whose key was pressed is running in
     /// a pane of a terminal that is by definition already up, so a terminal
     /// that is not running means the bundle id is wrong, and opening a fresh
-    /// window would not be what the key meant. macOS may refuse a background
-    /// app's `activate` outright, which is what the second attempt is for —
-    /// `openApplication` on an already-running app raises it the way `open -a`
-    /// does.
+    /// window would not be what the key meant. Since macOS 14, `activate` from
+    /// a background app is only a request: it can report success and leave the
+    /// current app in front. So check the outcome, then ask LaunchServices the
+    /// way `open -a` does, and log what happened.
     private func raiseTerminal() {
         let identifier = Self.terminalBundleID
         guard let app = NSRunningApplication
             .runningApplications(withBundleIdentifier: identifier).first
-        else { return }
+        else {
+            focusLogger.error("Raise skipped: \(identifier, privacy: .public) is not running")
+            return
+        }
         guard !app.isActive else { return }
-        if app.activate(options: []) { return }
-        guard let url = app.bundleURL else { return }
-        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+        if app.isHidden { app.unhide() }
+        let accepted = app.activate(options: [])
+        Task { @MainActor [weak self] in
+            func front() -> String { NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "none" }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard front() != identifier else {
+                self?.focusLogger.info("Raised \(identifier, privacy: .public) via activate")
+                return
+            }
+            guard let url = app.bundleURL else { return }
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            do {
+                _ = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
+            } catch {
+                self?.focusLogger.error("Raise via LaunchServices failed: \(error.localizedDescription, privacy: .public)")
+            }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            let outcome = front()
+            if outcome == identifier {
+                self?.focusLogger.info("Raised \(identifier, privacy: .public) via LaunchServices (activate accepted=\(accepted))")
+            } else {
+                self?.focusLogger.error("Could not raise \(identifier, privacy: .public); \(outcome, privacy: .public) stayed in front (activate accepted=\(accepted))")
+            }
+        }
     }
 }
