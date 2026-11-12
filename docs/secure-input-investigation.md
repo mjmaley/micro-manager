@@ -189,3 +189,73 @@ No MicroManager, Herdr, pad, or Mac restart was needed during validation.
 
 No Secure Input disabling API, permission change, forced process termination,
 or Herdr restart was performed as part of these checks or the preventive fix.
+
+## Read-only ownership follow-up — 2026-09-30
+
+The user chose to preserve running sessions after a keypad freeze following
+unlock. Ghostty's manual menu was unchecked, a user-operated on/off toggle did
+not establish recovery, and a subsequent user-operated Ghostty restart left
+Carbon reporting Secure Input enabled with the old, exited PID association.
+See [the current incident](HANDOFF.md#september-30-keypad-stuck-after-unlock-secure-input-reactivated).
+
+### Public observation is not complete ownership introspection
+
+The installed Apple macOS 27 SDK's `CarbonEventsCore.h`, lines 2970–3065,
+documents balanced enable/disable counts, conditional cleanup after an application
+crash if no other application has enabled protection, and a global Boolean query:
+`IsSecureEventInputEnabled` reports whether **any process** has enabled it.
+It does not return the count or a holder list. This is the public API contract,
+not proof of which process or internal bookkeeping is responsible in this incident.
+The header is under
+`/Library/Developer/CommandLineTools/SDKs/MacOSX27.0.sdk/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/HIToolbox.framework/Versions/A/Headers/`.
+[Apple TN2150](https://developer.apple.com/library/archive/technotes/tn2150/_index.html)
+also describes any-process/background protection and the obligation to release
+secure entry when no longer needed.
+
+Published [XNU's secure-console privilege check](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/iokit/Kernel/IOUserClient.cpp#L1490-L1532)
+compares the requesting process against a single numeric console-session PID.
+It does not test that association's liveness or enumerate Carbon callers.
+[IOHIDFamily consumes this privilege result](https://github.com/apple-oss-distributions/IOHIDFamily/blob/777ccd9698845aadf711e32d843c8c9b777431d9/IOHIDFamily/IOHIDLibUserClient.cpp#L569-L644)
+to control keyboard-client validity. Neither published snapshot was established
+as the installed macOS 27 implementation. No supported public read-only command
+for resolving an exited association to all remaining holders was established.
+
+### Why an unchecked Ghostty menu is inconclusive
+
+Installed Ghostty metadata identifies version 1.3.1, build 15212, commit
+`332b2aefc`. Its tagged [menu/action implementation](https://raw.githubusercontent.com/ghostty-org/ghostty/v1.3.1/macos/Sources/App/macOS/AppDelegate.swift)
+sets the checkmark from the manual `SecureInput.global` flag, not the aggregate
+enabled state. The [scope manager](https://raw.githubusercontent.com/ghostty-org/ghostty/v1.3.1/macos/Sources/Features/Secure%20Input/SecureInput.swift)
+requests protection for `global || any focused scoped object`; switching the
+manual flag off need not issue a disable when an automatic scope still requests
+protection. This explains a diagnostic limitation, not current ownership.
+
+The [automatic terminal heuristic](https://raw.githubusercontent.com/ghostty-org/ghostty/v1.3.1/src/termio/Exec.zig)
+requires ICANON=true and ECHO=false. A read-only snapshot of the current outer
+Herdr TTY instead found both false. That excludes the predicate at the sampled
+instant, not every possible stale scope or another application's secure field.
+No protected text or terminal contents were inspected.
+
+### Remaining non-disruptive evidence path
+
+Sampled HID registry classes exposed no additional secure-holder property.
+Existing loginwindow logs recorded a release request just before the observed
+clear/reactivation; this does not establish loginwindow as the current holder.
+No matching Ghostty SecureInput entries were retained in the inspected historical
+window. Ghostty's successful transitions use debug-level OSLog, and
+[Apple documents logging persistence limits](https://developer.apple.com/documentation/os/generating-log-messages-from-your-code);
+missing historical rows cannot establish that no transition happened.
+
+Passive, narrowly filtered unified-log observation can capture future naturally
+occurring Ghostty transitions without changing protection or provoking activity:
+
+```bash
+/usr/bin/log stream --level debug --style compact \
+  --predicate 'subsystem == "com.mitchellh.ghostty" AND category == "SecureInput"'
+```
+
+The tagged scope manager logs its own successful calls and OSStatus failures,
+not every application's scope. This proposed observer was not launched as a
+persistent service. Read-only registry snapshots, existing logs, TTY mode
+metadata, and public state queries were exercised; no bypass, forced release,
+new instrumentation, session interruption, build, or test was performed.
