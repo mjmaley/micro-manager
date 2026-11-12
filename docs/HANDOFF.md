@@ -23,14 +23,27 @@ unchanged; the Herdr fork trial used disposable isolated instances only.
 ## Installed app is NOT the full branch build
 
 Installed: `/Applications/MicroManager.app`, bundle ID `cc.worklouder.micromanager`.
-Executable SHA-256, rechecked September 23:
+**November 12 (user-approved): the herdr-core synchronous build is installed.**
+Executable SHA-256:
 
 ```text
-0b2ef2445f7c2d5437920771db0832acd92f4458bd77034dd38ec67e0b04ac36
+e8425c02ceb60b2efabbb2df3c16c46dd83f3ec2714ad03efff6eb25de86ca29
 ```
 
-This is the September 9 Secure Input build. It includes the Herdr focus repair,
-media ownership, read-aware lighting, and one-time layer handoff, but uses the
+Built from commit `fe76859` with the reconstruction recipe below and
+`WL_MACOS_SDK=…/MacOSX26.5.sdk ./scripts/bundle.sh` (`minos 13.0 sdk 26.5`,
+ad-hoc, designated requirement `identifier "cc.worklouder.micromanager"`).
+Previous September 9 build (`0b2ef244…ac36`) backed up with `ditto` to
+`~/.config/micromanager/app-backups/MicroManager-pre-herdr-core-20261112.app`
+(signature verified). Installation: verified PID 2227's exact path, SIGTERM,
+`ditto` the staged bundle, `open`. The new process started from
+`/Applications`, is the only copy, and a process sample showed its
+`HerdrClient.loadSnapshot` → `herdr-core`/`herdr-app` polling. The pad was
+absent from the HID bus both before (old app's log) and after installation, so
+lighting, keys, Input Monitoring carry-over, and focus actions are unverified
+until the pad reconnects. To roll back: quit it, `ditto` the backup back.
+
+Like the September 9 build, it uses the
 **original synchronous HID writer and lighting pipeline**. The working branch
 also includes `HIDWriteQueue.swift`, `PadLightingCache.swift`, background writes,
 latest-wins lighting, changed-key/zone writes, and 120 ms input-quiet coalescing.
@@ -38,7 +51,7 @@ Those changes are preserved for later validation, **not installed or cleared for
 production**. Secure Input alone can explain `kIOReturnNotPermitted`; the earlier
 write-queue experiment was not proven to cause that error.
 
-The original staging directory and app backups were under `/tmp` and may no
+Older staging directories and the September backups under `/tmp` may no
 longer exist. Do not depend on them. The durable reconstruction is the checked-in
 `docs/secure-input-release-exclusions.patch`; the older
 `herdr-090-focus-only-exclusions.patch` is historical and wrong for this checkpoint.
@@ -72,9 +85,9 @@ an old local `build/MicroManager.app`; it may predate critical fixes.
 
 ### herdr-core adapter — source only
 
-The November 12 cutover replaces the TUI-fork adapter. It is **committed on
-`layer-aware-herdr` but not installed**; the installed app still uses its
-September 9 local-only adapter and sees nothing under herdr-core. The
+The November 12 cutover replaces the TUI-fork adapter. It is committed on
+`layer-aware-herdr` and its synchronous build is **installed** (see above); pad
+behavior awaits physical validation. The
 `mjmaley/herdr` fork branch is no longer used by MicroManager.
 
 The committed recipe above (with the regenerated patch) passed 80 synchronous
@@ -82,7 +95,7 @@ tests and `WL_MACOS_SDK=…/MacOSX26.5.sdk ./scripts/bundle.sh` produced a stage
 bundle: `minos 13.0 sdk 26.5`, ad-hoc signed with the same designated requirement
 as the installed app (`identifier "cc.worklouder.micromanager"`), executable
 SHA-256 `e8425c02ceb60b2efabbb2df3c16c46dd83f3ec2714ad03efff6eb25de86ca29`. It was
-left in a `$TMPDIR` stage, not launched or installed; rebuild it if that is gone.
+then installed from that stage (see [installed app](#installed-app-is-not-the-full-branch-build)).
 
 - `HerdrClient` reads `terminal.list` through `herdr-core connect` (JSON-RPC on
   stdin/stdout, one process per request) plus `herdr-app ls` and `herdr-app
