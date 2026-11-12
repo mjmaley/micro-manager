@@ -72,10 +72,17 @@ an old local `build/MicroManager.app`; it may predate critical fixes.
 
 ### herdr-core adapter — source only
 
-The November 12 cutover replaces the TUI-fork adapter in the primary tree. It is
-**uncommitted, unpublished, and not installed**; the installed app still uses
-its September 9 local-only adapter and sees nothing under herdr-core. The
+The November 12 cutover replaces the TUI-fork adapter. It is **committed on
+`layer-aware-herdr` but not installed**; the installed app still uses its
+September 9 local-only adapter and sees nothing under herdr-core. The
 `mjmaley/herdr` fork branch is no longer used by MicroManager.
+
+The committed recipe above (with the regenerated patch) passed 80 synchronous
+tests and `WL_MACOS_SDK=…/MacOSX26.5.sdk ./scripts/bundle.sh` produced a staged
+bundle: `minos 13.0 sdk 26.5`, ad-hoc signed with the same designated requirement
+as the installed app (`identifier "cc.worklouder.micromanager"`), executable
+SHA-256 `e8425c02ceb60b2efabbb2df3c16c46dd83f3ec2714ad03efff6eb25de86ca29`. It was
+left in a `$TMPDIR` stage, not launched or installed; rebuild it if that is gone.
 
 - `HerdrClient` reads `terminal.list` through `herdr-core connect` (JSON-RPC on
   stdin/stdout, one process per request) plus `herdr-app ls` and `herdr-app
