@@ -1,8 +1,8 @@
 diff --git a/README.md b/README.md
-index 8e0bd15..b388d56 100644
+index 68a2951..4d24b00 100644
 --- a/README.md
 +++ b/README.md
-@@ -386,16 +386,6 @@ clearing a newly observed Herdr layer. This is a best-effort shared-HID handoff:
+@@ -423,16 +423,6 @@ clearing a newly observed Herdr layer. This is a best-effort shared-HID handoff:
  the physical switch and another client's writes are not atomic with our poll.
  No keypresses, app activation, or keymap writes are used for the clear.
  
@@ -19,14 +19,14 @@ index 8e0bd15..b388d56 100644
  **Known limitation:** Codex itself does not check the layer for `AG00`–`AG05`.
  Double-pressing one of those keys can still bring Codex forward, even on Layer 2.
  The current mapping intentionally retains those codes; shared HID access cannot
-@@ -411,7 +401,6 @@ swift test --skip Live  # non-live suite; full Xcode required
- ./scripts/test-swift-suite.sh AgentLightingTests
- ./scripts/test-swift-suite.sh HerdrFocusTests
+@@ -457,7 +447,6 @@ swift test --skip Live  # non-live suite; matching full Xcode required
+ ./scripts/test-swift-suite.sh HerdrMachineTests
+ ./scripts/test-swift-suite.sh AgentNotificationTests
  ./scripts/test-swift-suite.sh SecureInputTests
 -./scripts/test-swift-suite.sh InputResponsivenessTests
  ./scripts/test-dictation-media.sh
  swift run WLInspector  # the debug UI
- ./scripts/bundle.sh    # assemble build/MicroManager.app, unsigned install
+ WL_MACOS_SDK=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk ./scripts/bundle.sh  # packaging only after hardware validation; no --install
 diff --git a/Sources/WLInspector/AppModel.swift b/Sources/WLInspector/AppModel.swift
 index 7f47e0d..a2b84d3 100644
 --- a/Sources/WLInspector/AppModel.swift
