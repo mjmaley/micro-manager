@@ -4,11 +4,10 @@
 > [schacon/micro-manager](https://github.com/schacon/micro-manager). Custom
 > Codex Micro, Pi, notification, and herdr-core work is on
 > `layer-aware-herdr`. The upstream download links below do not include these
-> changes. **On the maintainer's Mac, the herdr-core synchronous build is
-> installed (November 12) but not yet validated on the pad.** Before building or
-> resuming work, read the
-> [current handoff](docs/HANDOFF.md): the primary tree also retains deferred
-> HID/lighting experiments that are not hardware-cleared for installation.
+> changes. **On the maintainer's Mac, the full branch build (herdr-core adapter
+> plus the background HID writer and lighting coalescing) is installed for
+> hardware validation since November 12.** Before building or resuming work,
+> read the [current handoff](docs/HANDOFF.md).
 
 A macOS menu-bar app that lights each running [Herdr](https://herdr.dev) agent
 on its own key of a Work Louder **Codex Micro** or

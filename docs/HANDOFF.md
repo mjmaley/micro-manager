@@ -20,36 +20,37 @@ unchanged; the Herdr fork trial used disposable isolated instances only.
 - The official OMP hook installed outside this repository is **not** part of a git
   push. Its installation command and activation checks are documented below.
 
-## Installed app is NOT the full branch build
+## Installed app: full branch build under hardware validation
 
 Installed: `/Applications/MicroManager.app`, bundle ID `cc.worklouder.micromanager`.
-**November 12 (user-approved): the herdr-core synchronous build is installed.**
-Executable SHA-256:
+**November 12, 17:11 (user-approved): the full primary-tree build is installed,
+including the deferred latency work**, to fix agent-key lag over Bluetooth LE
+(see incidents). Executable SHA-256:
 
 ```text
-e8425c02ceb60b2efabbb2df3c16c46dd83f3ec2714ad03efff6eb25de86ca29
+1b73247ddbb5204ba88611275011064e89bfb1e21c02e0aae8805f8eb90619d7
 ```
 
-Built from commit `fe76859` with the reconstruction recipe below and
+Built from commit `0ecc2e2` (HEAD archive, **no exclusions patch**) with
 `WL_MACOS_SDK=…/MacOSX26.5.sdk ./scripts/bundle.sh` (`minos 13.0 sdk 26.5`,
-ad-hoc, designated requirement `identifier "cc.worklouder.micromanager"`).
-Previous September 9 build (`0b2ef244…ac36`) backed up with `ditto` to
-`~/.config/micromanager/app-backups/MicroManager-pre-herdr-core-20261112.app`
-(signature verified). Installation: verified PID 2227's exact path, SIGTERM,
-`ditto` the staged bundle, `open`. The new process started from
-`/Applications`, is the only copy, and a process sample showed its
-`HerdrClient.loadSnapshot` → `herdr-core`/`herdr-app` polling. The pad was
-absent from the HID bus both before (old app's log) and after installation, so
-lighting, keys, Input Monitoring carry-over, and focus actions are unverified
-until the pad reconnects. To roll back: quit it, `ditto` the backup back.
+ad-hoc, designated requirement `identifier "cc.worklouder.micromanager"`). It
+includes `HIDWriteQueue`, `PadLightingCache`, background writes, latest-wins
+lighting, changed-key/zone writes, 120 ms input-quiet coalescing, and the
+agent-key raise fix. Installation: verified the old PID's exact path, SIGTERM,
+`ditto`, `open`; one copy running; its log reported "Hardware input ready;
+fresh layer/keymap validated layer=2". Physical lag, raise behavior, and Secure
+Input interplay of the background writer are being validated with the user.
+Secure Input alone can explain `kIOReturnNotPermitted`; the earlier write-queue
+experiment was not proven to cause that error.
 
-Like the September 9 build, it uses the
-**original synchronous HID writer and lighting pipeline**. The working branch
-also includes `HIDWriteQueue.swift`, `PadLightingCache.swift`, background writes,
-latest-wins lighting, changed-key/zone writes, and 120 ms input-quiet coalescing.
-Those changes are preserved for later validation, **not installed or cleared for
-production**. Secure Input alone can explain `kIOReturnNotPermitted`; the earlier
-write-queue experiment was not proven to cause that error.
+Backups in `~/.config/micromanager/app-backups/` (`ditto`, signatures verified):
+
+| Backup | Build |
+|---|---|
+| `MicroManager-herdr-core-synchronous-20261112.app` | `e8425c02…ca29`: herdr-core adapter, synchronous HID writer (commit `fe76859` + exclusions patch) |
+| `MicroManager-pre-herdr-core-20261112.app` | `0b2ef244…ac36`: September 9 build, Herdr 0.9 server only |
+
+To roll back: quit MicroManager, `ditto` a backup to `/Applications/MicroManager.app`, open it.
 
 Older staging directories and the September backups under `/tmp` may no
 longer exist. Do not depend on them. The durable reconstruction is the checked-in
@@ -86,8 +87,8 @@ an old local `build/MicroManager.app`; it may predate critical fixes.
 ### herdr-core adapter — source only
 
 The November 12 cutover replaces the TUI-fork adapter. It is committed on
-`layer-aware-herdr` and its synchronous build is **installed** (see above); pad
-behavior awaits physical validation. The
+`layer-aware-herdr`. Its synchronous build was installed first, then replaced the
+same day by the full branch build (see above). The
 `mjmaley/herdr` fork branch is no longer used by MicroManager.
 
 The committed recipe above (with the regenerated patch) passed 80 synchronous
@@ -95,7 +96,8 @@ tests and `WL_MACOS_SDK=…/MacOSX26.5.sdk ./scripts/bundle.sh` produced a stage
 bundle: `minos 13.0 sdk 26.5`, ad-hoc signed with the same designated requirement
 as the installed app (`identifier "cc.worklouder.micromanager"`), executable
 SHA-256 `e8425c02ceb60b2efabbb2df3c16c46dd83f3ec2714ad03efff6eb25de86ca29`. It was
-then installed from that stage (see [installed app](#installed-app-is-not-the-full-branch-build)).
+then installed from that stage; it is now the `herdr-core-synchronous` backup
+(see [installed app](#installed-app-full-branch-build-under-hardware-validation)).
 
 - `HerdrClient` reads `terminal.list` through `herdr-core connect` (JSON-RPC on
   stdin/stdout, one process per request) plus `herdr-app ls` and `herdr-app
@@ -182,6 +184,20 @@ BLE writes (layer polling every 1.25 s plus full lighting repaints). This is
 the problem the deferred `HIDWriteQueue`/`PadLightingCache` work targets; it is
 not caused by the Herdr adapter. Not yet established: per-call SetReport
 duration, whether any press was dropped rather than delayed, and USB behavior.
+The synchronous profile also calls `forceRepaint()` (a full lighting write)
+after every agent-key focus.
+
+The user also reported agent keys not switching while another app (Brave) was
+in front. `herdr-app do agent.focus` works with the Herdr app in the
+background (verified: focused pane changed, Brave stayed in front), so the
+switch happened but the app was not raised. `raiseTerminal()` returned early
+whenever `activate()` reported success; under macOS 14+ cooperative activation
+a background app's request can be accepted yet not honored. Commit `0ecc2e2`
+checks the frontmost app after 250 ms, falls back to LaunchServices
+`openApplication(activates: true)`, unhides a hidden app, and logs the outcome
+under `HerdrFocus`. A test process launched from a Herdr terminal could raise
+Herdr with `activate()` alone, which does not establish MicroManager's case;
+check `log show --predicate 'category == "HerdrFocus"'` after a real press.
 
 ### November 12: Herdr moved to herdr-core + Herdr app
 
