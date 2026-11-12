@@ -3,25 +3,29 @@ import SwiftUI
 
 /// Maps a set of Herdr agents to device lighting.
 ///
-/// Each agent gets its own key. AgentLightingTracker supplies display-only
-/// done/idle states for unread/acknowledged completions; the bridge passes the
-/// selected agent's display state to the outer ring. The raw worst-state
-/// aggregate remains available for the menu-bar icon.
+/// Each agent gets its own key. Herdr's own read tracking decides done
+/// (finished, not yet seen in the app) versus idle; the bridge passes the
+/// focused agent's state to the outer ring. The worst-state aggregate remains
+/// available for the menu-bar icon.
 public struct BridgeConfig: Sendable {
-    /// Highest priority first for the raw aggregate/menu-bar indicator.
+    /// Highest priority first for the aggregate/menu-bar indicator.
     /// The outer ring follows the selected agent instead.
-    public var priority: [String] = ["blocked", "working", "unknown", "idle", "done"]
+    public var priority: [String] = ["blocked", "error", "working", "unknown", "idle", "done"]
     public var colors: [String: Int] = [
         "blocked": 0xFF2D2D,
+        // The program stopped on a failure it reported; red like blocked,
+        // but steady because there is no question to answer.
+        "error": 0xFF2D2D,
         "working": 0xFFA000,
-        // A completion stays green until viewed and then left. Plain idle
-        // or acknowledged completion is white, not perpetual finished-green.
+        // A completion stays green until it is seen in the Herdr app.
+        // Plain idle or a seen completion is white.
         "done": 0x00C853,
         "idle": 0xFFFFFF,
         "unknown": 0x90A4AE,
     ]
     public var effects: [String: OAI.Effect] = [
         "blocked": .breath,
+        "error": .solid,
         "working": .solid,
         "idle": .solid,
         "done": .solid,

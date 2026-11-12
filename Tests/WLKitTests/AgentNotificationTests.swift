@@ -1,97 +1,101 @@
-import XCTest
+import Foundation
+import Testing
 @testable import WLKit
 
-final class AgentNotificationTests: XCTestCase {
-    private func agent(_ state: String, pane: String = "p1", terminal: String = "t1", focused: Bool = false) -> HerdrAgent {
-        HerdrAgent(agent: "pi", status: state, paneID: pane, terminalID: terminal, focused: focused)
+struct AgentNotificationTests {
+    private func agent(_ state: String, address: String = "t1", created: Int64 = 1,
+                       focused: Bool = false) -> HerdrAgent {
+        HerdrAgent(agent: "pi", status: state, address: address, createdMs: created, focused: focused)
     }
 
-    private func consume(_ tracker: inout AgentNotificationTracker, _ agents: [HerdrAgent], identity: String = "server1", active: Bool = false) -> [AgentNotificationEvent] {
-        tracker.consume(agents, socketPath: "/tmp/herdr.sock", socketIdentity: identity, terminalActive: active)
+    private func consume(_ tracker: inout AgentNotificationTracker, _ agents: [HerdrAgent], active: Bool = false) -> [AgentNotificationEvent] {
+        tracker.consume(agents, terminalActive: active)
     }
 
-    func testStartupNewAgentsAndRepeatedPollsAreSilent() {
+    @Test func startupNewAgentsAndRepeatedPollsAreSilent() {
         var tracker = AgentNotificationTracker()
-        XCTAssertTrue(consume(&tracker, [agent("blocked")]).isEmpty)
-        XCTAssertTrue(consume(&tracker, [agent("blocked")]).isEmpty)
-        XCTAssertTrue(consume(&tracker, [agent("blocked"), agent("done", pane: "p2", terminal: "t2")]).isEmpty)
+        #expect(consume(&tracker, [agent("blocked")]).isEmpty)
+        #expect(consume(&tracker, [agent("blocked")]).isEmpty)
+        #expect(consume(&tracker, [agent("blocked"), agent("done", address: "t2")]).isEmpty)
     }
 
-    func testAttentionAndCompletionAreEmittedOnce() {
+    @Test func attentionAndCompletionAreEmittedOnce() {
         var tracker = AgentNotificationTracker()
         _ = consume(&tracker, [agent("working")])
-        XCTAssertEqual(consume(&tracker, [agent("blocked")]).map(\.kind), [.attention])
-        XCTAssertTrue(consume(&tracker, [agent("blocked")]).isEmpty)
-        XCTAssertEqual(consume(&tracker, [agent("done")]).map(\.kind), [.finished])
-        XCTAssertTrue(consume(&tracker, [agent("idle")]).isEmpty)
+        #expect(consume(&tracker, [agent("blocked")]).map(\.kind) == [.attention])
+        #expect(consume(&tracker, [agent("blocked")]).isEmpty)
+        #expect(consume(&tracker, [agent("done")]).map(\.kind) == [.finished])
+        #expect(consume(&tracker, [agent("idle")]).isEmpty)
+        _ = consume(&tracker, [agent("working")])
+        #expect(consume(&tracker, [agent("error")]).map(\.kind) == [.attention])
     }
 
-    func testFocusedPaneAlertsOnlyWhenTerminalIsNotActive() {
+    @Test func focusedPaneAlertsOnlyWhenTerminalIsNotActive() {
         var tracker = AgentNotificationTracker()
         _ = consume(&tracker, [agent("working", focused: true)], active: true)
-        XCTAssertTrue(consume(&tracker, [agent("blocked", focused: true)], active: true).isEmpty)
-        XCTAssertTrue(consume(&tracker, [agent("blocked", focused: true)], active: false).isEmpty)
+        #expect(consume(&tracker, [agent("blocked", focused: true)], active: true).isEmpty)
+        #expect(consume(&tracker, [agent("blocked", focused: true)]).isEmpty)
         _ = consume(&tracker, [agent("working", focused: true)])
-        XCTAssertEqual(consume(&tracker, [agent("idle", focused: true)]).map(\.kind), [.finished])
+        #expect(consume(&tracker, [agent("idle", focused: true)]).map(\.kind) == [.finished])
     }
 
-    func testBackgroundPaneStillAlertsWithTerminalActive() {
+    @Test func backgroundPaneStillAlertsWithTerminalActive() {
         var tracker = AgentNotificationTracker()
         _ = consume(&tracker, [agent("working")], active: true)
-        XCTAssertEqual(consume(&tracker, [agent("blocked")], active: true).map(\.kind), [.attention])
+        #expect(consume(&tracker, [agent("blocked")], active: true).map(\.kind) == [.attention])
     }
 
-    func testReconnectWakeAndServerReplacementRebaseline() {
+    @Test func reconnectAndWakeRebaseline() {
         var tracker = AgentNotificationTracker()
         _ = consume(&tracker, [agent("working")])
         tracker.reset()
-        XCTAssertTrue(consume(&tracker, [agent("done")]).isEmpty)
-        _ = consume(&tracker, [agent("working")])
-        XCTAssertTrue(consume(&tracker, [agent("blocked")], identity: "server2").isEmpty)
+        #expect(consume(&tracker, [agent("done")]).isEmpty)
     }
 
-    func testRemovedAndReusedPaneDoesNotInheritState() {
+    @Test func replacedTerminalAtTheSameAddressDoesNotInheritState() {
         var tracker = AgentNotificationTracker()
         _ = consume(&tracker, [agent("working")])
-        XCTAssertTrue(consume(&tracker, [agent("blocked", terminal: "replacement")]).isEmpty)
+        #expect(consume(&tracker, [agent("blocked", created: 2)]).isEmpty)
         _ = consume(&tracker, [])
-        XCTAssertTrue(consume(&tracker, [agent("blocked")]).isEmpty)
+        #expect(consume(&tracker, [agent("blocked")]).isEmpty)
     }
 
-    func testReorderingDoesNotChangeDestination() {
+    @Test func reorderingDoesNotChangeDestination() throws {
         var tracker = AgentNotificationTracker()
-        let second = agent("working", pane: "p2", terminal: "t2")
+        let second = agent("working", address: "t2")
         _ = consume(&tracker, [agent("working"), second])
         let events = consume(&tracker, [second, agent("blocked")])
-        XCTAssertEqual(events.count, 1)
-        XCTAssertEqual(events.first?.target.paneID, "p1")
-        XCTAssertEqual(events.first?.target.terminalID, "t1")
+        let destination = try #require(agent("blocked").focusTarget)
+        #expect(events.map(\.target) == [destination])
     }
 
-    func testUnknownIdleAndAgentReplacementDoNotAnnounceCompletion() {
+    @Test func unknownIdleAndAgentReplacementDoNotAnnounceCompletion() {
         var tracker = AgentNotificationTracker()
         _ = consume(&tracker, [agent("unknown")])
-        XCTAssertTrue(consume(&tracker, [agent("idle")]).isEmpty)
+        #expect(consume(&tracker, [agent("idle")]).isEmpty)
         _ = consume(&tracker, [agent("working")])
         var replacement = agent("done")
         replacement.agent = "codex"
-        XCTAssertTrue(consume(&tracker, [replacement]).isEmpty)
+        #expect(consume(&tracker, [replacement]).isEmpty)
     }
 
-    func testMissingIdentityIsNotTargetable() {
-        let missing = HerdrAgent(status: "blocked", paneID: "p1")
-        XCTAssertNil(AgentNotificationTarget(agent: missing, socketPath: "/tmp/h.sock", socketIdentity: "server"))
-        XCTAssertNil(AgentNotificationTarget.socketIdentity(at: "/no-such-herdr-socket"))
+    @Test func sameTerminalNumberOnAnotherMachineIsAnotherAgent() {
+        var tracker = AgentNotificationTracker()
+        _ = consume(&tracker, [agent("working"), agent("working", address: "rohan/t1")])
+        let events = consume(&tracker, [agent("blocked"), agent("working", address: "rohan/t1")])
+        #expect(events.map(\.target.address) == ["t1"])
+        let finished = consume(&tracker, [agent("blocked"), agent("idle", address: "rohan/t1")])
+        #expect(finished.map(\.target.address) == ["rohan/t1"])
+        #expect(finished.map(\.kind) == [.finished])
     }
 
-    func testDestinationRoundTripAndStalePaneValidation() throws {
-        let target = try XCTUnwrap(AgentNotificationTarget(agent: agent("working"), socketPath: "/tmp/herdr.sock", socketIdentity: "server1"))
-        let decoded = try JSONDecoder().decode(AgentNotificationTarget.self, from: JSONEncoder().encode(target))
-        XCTAssertEqual(decoded, target)
-        XCTAssertTrue(target.matches(agent("done")))
-        XCTAssertFalse(target.matches(agent("done", terminal: "replacement")))
-        XCTAssertFalse(target.matches(agent("done", pane: "replacement")))
-        let other = try XCTUnwrap(AgentNotificationTarget(agent: agent("working"), socketPath: "/tmp/other.sock", socketIdentity: "server1"))
-        XCTAssertNotEqual(target.identifier, other.identifier)
+    @Test func missingIdentityIsNotTargetable() {
+        let missing = HerdrAgent(status: "blocked", createdMs: nil)
+        #expect(HerdrAgentTarget(agent: missing) == nil)
+        var tracker = AgentNotificationTracker()
+        _ = consume(&tracker, [missing])
+        var idle = missing
+        idle.status = "idle"
+        #expect(consume(&tracker, [idle]).isEmpty)
     }
 }

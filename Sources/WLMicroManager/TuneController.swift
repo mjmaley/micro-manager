@@ -32,15 +32,15 @@ final class TuneController {
     /// Where each Claude pane sits on the effort ladder and model list. Blind
     /// state: it starts at the defaults and follows our own commands, so a
     /// change made by hand inside the session drifts it until the next nudge.
-    private var claudeEffortIndex: [String: Int] = [:]
-    private var claudeModelIndex: [String: Int] = [:]
+    private var claudeEffortIndex: [HerdrAgentTarget: Int] = [:]
+    private var claudeModelIndex: [HerdrAgentTarget: Int] = [:]
 
     /// The codex pane whose `/model` picker we opened, if any. Deflections
     /// steer the picker only while this is fresh; a stale entry means the
     /// picker was dealt with by hand.
-    private var modelPickerPane: String?
+    private var modelPickerPane: HerdrAgentTarget?
     private var modelPickerOpened: Date?
-    private var thinkingPickerPane: String?
+    private var thinkingPickerPane: HerdrAgentTarget?
     private var thinkingPickerOpened: Date?
     private static let pickerLifetime: TimeInterval = 30
 
@@ -79,7 +79,7 @@ final class TuneController {
                 try await send(command: "/effort \(ladder[index])", to: pane)
             } else if kind.contains("codex") {
                 try await HerdrClient.sendKeys(
-                    paneID: pane,
+                    target: pane,
                     keys: [step > 0 ? Self.codexEffortUpChord : Self.codexEffortDownChord]
                 )
             } else if isPi(kind) {
@@ -98,7 +98,7 @@ final class TuneController {
         guard isPi(kind) else { return }
         do {
             if pickerIsOpen(pane: thinkingPickerPane, opened: thinkingPickerOpened, target: pane) {
-                try await HerdrClient.sendKeys(paneID: pane, keys: ["enter"])
+                try await HerdrClient.sendKeys(target: pane, keys: ["enter"])
                 thinkingPickerPane = nil
                 thinkingPickerOpened = nil
             } else {
@@ -114,7 +114,7 @@ final class TuneController {
         }
     }
 
-    private func piThinking(_ step: Int, pane: String) async throws {
+    private func piThinking(_ step: Int, pane: HerdrAgentTarget) async throws {
         if !pickerIsOpen(pane: thinkingPickerPane, opened: thinkingPickerOpened, target: pane) {
             modelPickerPane = nil
             modelPickerOpened = nil
@@ -124,7 +124,7 @@ final class TuneController {
             // Give Pi one rendering turn before steering the new picker.
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
-        try await HerdrClient.sendKeys(paneID: pane, keys: [step > 0 ? "down" : "up"])
+        try await HerdrClient.sendKeys(target: pane, keys: [step > 0 ? "down" : "up"])
         thinkingPickerOpened = Date()
     }
 
@@ -148,13 +148,13 @@ final class TuneController {
         if direction == .east || direction == .west {
             // Horizontal movement keeps its existing meaning while Pi/Codex's
             // model picker is open. Otherwise it is an agent-bank gesture.
-            var focusedPaneID: String?
+            var focusedTarget: HerdrAgentTarget?
             do {
-                focusedPaneID = try await HerdrClient.focusedAgent()?.paneID
+                focusedTarget = try await HerdrClient.focusedAgent()?.focusTarget
             } catch {
-                focusedPaneID = nil
+                focusedTarget = nil
             }
-            let pickerOpen = focusedPaneID.map {
+            let pickerOpen = focusedTarget.map {
                 pickerIsOpen(pane: modelPickerPane, opened: modelPickerOpened, target: $0)
             } ?? false
             if !pickerOpen {
@@ -193,7 +193,7 @@ final class TuneController {
     /// natural top or bottom.
     private func claudeModel(
         _ direction: Pad.JoystickDirection,
-        pane: String,
+        pane: HerdrAgentTarget,
         agent: String
     ) async throws {
         let models = bindings().claudeModels
@@ -218,7 +218,7 @@ final class TuneController {
 
     private func tuiModel(
         _ direction: Pad.JoystickDirection,
-        pane: String,
+        pane: HerdrAgentTarget,
         agent: String,
         showCodexGuide: Bool,
         invertVertical: Bool
@@ -239,18 +239,18 @@ final class TuneController {
 
         switch direction {
         case .north:
-            try await HerdrClient.sendKeys(paneID: pane, keys: [invertVertical ? "down" : "up"])
+            try await HerdrClient.sendKeys(target: pane, keys: [invertVertical ? "down" : "up"])
             if showCodexGuide { showCodexModels(agent: agent) }
         case .south:
-            try await HerdrClient.sendKeys(paneID: pane, keys: [invertVertical ? "up" : "down"])
+            try await HerdrClient.sendKeys(target: pane, keys: [invertVertical ? "up" : "down"])
             if showCodexGuide { showCodexModels(agent: agent) }
         case .east:
-            try await HerdrClient.sendKeys(paneID: pane, keys: ["enter"])
+            try await HerdrClient.sendKeys(target: pane, keys: ["enter"])
             modelPickerPane = nil
             modelPickerOpened = nil
             TunePanelController.shared.hide()
         case .west:
-            try await HerdrClient.sendKeys(paneID: pane, keys: ["esc"])
+            try await HerdrClient.sendKeys(target: pane, keys: ["esc"])
             modelPickerPane = nil
             modelPickerOpened = nil
             TunePanelController.shared.hide()
@@ -276,21 +276,21 @@ final class TuneController {
         kind == "pi" || kind.contains("pi-coding-agent")
     }
 
-    private func pickerIsOpen(pane: String?, opened: Date?, target: String) -> Bool {
+    private func pickerIsOpen(pane: HerdrAgentTarget?, opened: Date?, target: HerdrAgentTarget) -> Bool {
         pane == target && Date().timeIntervalSince(opened ?? .distantPast) < Self.pickerLifetime
     }
 
-    private func focusedPane() async -> (HerdrAgent, String)? {
-        guard let agent = try? await HerdrClient.focusedAgent(), let pane = agent.paneID else {
+    private func focusedPane() async -> (HerdrAgent, HerdrAgentTarget)? {
+        guard let agent = try? await HerdrClient.focusedAgent(), let pane = agent.focusTarget else {
             onError?("Nothing has focus in Herdr right now.")
             return nil
         }
         return (agent, pane)
     }
 
-    /// Slash commands go in as text plus enter: typed, then submitted.
-    private func send(command: String, to pane: String) async throws {
-        try await HerdrClient.sendText(paneID: pane, text: command)
-        try await HerdrClient.sendKeys(paneID: pane, keys: ["enter"])
+    /// Slash commands are pasted and submitted. herdr-core holds them behind
+    /// a person's unsent draft and refuses a program that is asking something.
+    private func send(command: String, to pane: HerdrAgentTarget) async throws {
+        try await HerdrClient.submitText(target: pane, text: command)
     }
 }

@@ -20,8 +20,7 @@ final class PiControlController {
         Task {
             guard let pane = await focusedPiPane() else { return }
             do {
-                try await HerdrClient.sendText(paneID: pane, text: "/fork")
-                try await HerdrClient.sendKeys(paneID: pane, keys: ["enter"])
+                try await HerdrClient.submitText(target: pane, text: "/fork")
             } catch {
                 onError?(error.localizedDescription)
             }
@@ -31,16 +30,16 @@ final class PiControlController {
     private func sendKeys(_ keys: [String], onlyWhenBlocked: Bool = false) async {
         guard let pane = await focusedPiPane(requireBlocked: onlyWhenBlocked) else { return }
         do {
-            try await HerdrClient.sendKeys(paneID: pane, keys: keys)
+            try await HerdrClient.sendKeys(target: pane, keys: keys)
         } catch {
             onError?(error.localizedDescription)
         }
     }
 
-    private func focusedPiPane(requireBlocked: Bool = false) async -> String? {
+    private func focusedPiPane(requireBlocked: Bool = false) async -> HerdrAgentTarget? {
         do {
             guard let agent = try await HerdrClient.focusedAgent(),
-                  let pane = agent.paneID else {
+                  let pane = agent.focusTarget else {
                 onError?("Nothing has focus in Herdr right now.")
                 return nil
             }

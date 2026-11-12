@@ -1,6 +1,50 @@
+diff --git a/README.md b/README.md
+index 8e0bd15..b388d56 100644
+--- a/README.md
++++ b/README.md
+@@ -386,16 +386,6 @@ clearing a newly observed Herdr layer. This is a best-effort shared-HID handoff:
+ the physical switch and another client's writes are not atomic with our poll.
+ No keypresses, app activation, or keymap writes are used for the clear.
+ 
+-**Deferred latency experiment (not installed).** Normal RPC report writes run on a serial
+-background queue, keeping the main queue available for button/dial input. Each
+-JSON message stays contiguous on the wire. Lighting keeps only the latest pending
+-picture and waits for 120 ms of input quiet before painting; the resulting small
+-lighting delay is intentional. Only changed keys/zones are sent, so changing the
+-ring does not resend all keys. Another client's read-only status replies do not
+-invalidate lighting. Reconnects and explicit Refresh still restore a full picture.
+-Synchronous off/sleep flushing remains serialized with queued writes, and a
+-transport is not closed until its current message finishes.
+-
+ **Known limitation:** Codex itself does not check the layer for `AG00`–`AG05`.
+ Double-pressing one of those keys can still bring Codex forward, even on Layer 2.
+ The current mapping intentionally retains those codes; shared HID access cannot
+@@ -411,7 +401,6 @@ swift test --skip Live  # non-live suite; full Xcode required
+ ./scripts/test-swift-suite.sh AgentLightingTests
+ ./scripts/test-swift-suite.sh HerdrFocusTests
+ ./scripts/test-swift-suite.sh SecureInputTests
+-./scripts/test-swift-suite.sh InputResponsivenessTests
+ ./scripts/test-dictation-media.sh
+ swift run WLInspector  # the debug UI
+ ./scripts/bundle.sh    # assemble build/MicroManager.app, unsigned install
+diff --git a/Sources/WLInspector/AppModel.swift b/Sources/WLInspector/AppModel.swift
+index 7f47e0d..a2b84d3 100644
+--- a/Sources/WLInspector/AppModel.swift
++++ b/Sources/WLInspector/AppModel.swift
+@@ -80,7 +80,7 @@ final class AppModel: ObservableObject {
+         device.onTX = { [weak self] method, params, id in
+             self?.log(.tx, "\(method)  #\(id)", self?.encode(params) ?? "")
+         }
+-        device.onResponse = { [weak self] id, _, result, error in
++        device.onResponse = { [weak self] id, result, error in
+             guard let self else { return }
+             if let error {
+                 self.log(.error, "response #\(id)", error)
+diff --git a/Sources/WLKit/BridgeController.swift b/Sources/WLKit/BridgeController.swift
+index d9b2f0c..bd6e522 100644
 --- a/Sources/WLKit/BridgeController.swift
 +++ b/Sources/WLKit/BridgeController.swift
-@@ -136,11 +136,6 @@
+@@ -121,11 +121,6 @@ public final class BridgeController: ObservableObject {
      private var snapshotSequence = 0
      private var lastFingerprint: String?
      private var layerLighting = LayerLightingState()
@@ -9,10 +53,10 @@
 -    private var lightingTask: Task<Void, Never>?
 -    private var lightingWorkerGeneration: UInt64 = 0
 -    private var lastInputAt: TimeInterval = -.infinity
-     private var agentLightingTracker = AgentLightingTracker()
      private var terminalActivationObserver: NSObjectProtocol?
      private var lastPublishedFingerprint: String?
-@@ -185,7 +180,6 @@
+     private var issuedIDs = Set<Int>()
+@@ -169,7 +164,6 @@ public final class BridgeController: ObservableObject {
              self.hardwareInputReady = false
              self.activeLayerNumber = nil
              self.layerLighting.reset()
@@ -20,7 +64,7 @@
              self.lastFingerprint = nil
              if self.isRunning { self.scheduleReopen() }
          }
-@@ -200,23 +194,20 @@
+@@ -184,23 +178,20 @@ public final class BridgeController: ObservableObject {
          device.onTX = { [weak self] _, _, id in
              self?.issuedIDs.insert(id)
          }
@@ -52,23 +96,23 @@
                    let dict = params as? [String: Any],
                    let action = dict["act"] as? Int,
                    let index = OAI.agIndex(dict["k"] as? String)
-@@ -300,7 +291,6 @@
+@@ -284,7 +275,6 @@ public final class BridgeController: ObservableObject {
          secureInputPaused = false
          secureInputApplication = nil
          layerLighting.reset()
 -        resetLightingOutput()
-         agentLightingTracker.reset()
          stopFocusObservation()
          snapshotSequence += 1
-@@ -352,7 +342,6 @@
+         onAgentObservationReset?()
+@@ -331,7 +321,6 @@ public final class BridgeController: ObservableObject {
          hardwareInputReady = false
          secureInputTask?.cancel(); secureInputTask = nil
          layerLighting.reset()
 -        resetLightingOutput()
-         agentLightingTracker.endViewing()
          stopFocusObservation()
          snapshotSequence += 1
-@@ -550,10 +539,7 @@
+         onAgentObservationReset?()
+@@ -525,10 +514,7 @@ public final class BridgeController: ObservableObject {
          }
          let changed = previous != activeLayerNumber
          let handoff = layerLighting.observe(activeLayerNumber, managedLayer: herdrLayerNumber)
@@ -80,7 +124,7 @@
          if let handoff, padConfiguration.isCodexMicro {
              await clearLightingForLayerHandoff(token: handoff)
          }
-@@ -584,7 +570,6 @@
+@@ -559,7 +545,6 @@ public final class BridgeController: ObservableObject {
          hardwareInputReady = false
          activeLayerNumber = nil
          layerLighting.reset()
@@ -88,7 +132,7 @@
          lastFingerprint = nil
          statusFailureCount = 0
          lastError = message
-@@ -653,7 +638,6 @@
+@@ -628,7 +613,6 @@ public final class BridgeController: ObservableObject {
                  wideKeysDown.removeAll()
                  lastSubmitPressAt = nil
                  layerLighting.reset()
@@ -96,7 +140,7 @@
                  lastFingerprint = nil
                  activeLayerNumber = nil
                  keymapReady = false
-@@ -752,7 +736,6 @@
+@@ -683,7 +667,6 @@ public final class BridgeController: ObservableObject {
      // MARK: - Repaint
  
      public func forceRepaint() async {
@@ -104,7 +148,7 @@
          lastFingerprint = nil
          await refresh(forcePaint: true)
      }
-@@ -860,77 +843,27 @@
+@@ -782,77 +765,27 @@ public final class BridgeController: ObservableObject {
      private func apply(state: String?, threads: [OAI.Thread]) async {
          guard isRunning, deviceConnected, hardwareInputReady, !suspendedForSystemInactivity,
                !refreshSecureInput(), isHerdrLayerActive else { return }
@@ -203,7 +247,7 @@
          }
      }
  
-@@ -987,7 +920,6 @@
+@@ -909,7 +842,6 @@ public final class BridgeController: ObservableObject {
      /// Every bound key arrives here. Which key does what is the one place that
      /// has to agree with `Pad`, so keep the dispatch in a single switch.
      public func handleKeyPress(_ index: Int) {
@@ -211,7 +255,7 @@
          if onKeyIntercept?(index) == true { return }
          if index == Pad.fastKeyID {
              onFastKey?()
-@@ -1053,7 +985,7 @@
+@@ -975,7 +907,7 @@ public final class BridgeController: ObservableObject {
      public func setVoiceActive(_ active: Bool) async {
          guard voiceActive != active else { return }
          voiceActive = active
@@ -220,7 +264,7 @@
      }
  
      /// Lets app-layer features that fail outside the bridge surface their
-@@ -1076,14 +1008,14 @@
+@@ -998,14 +930,14 @@ public final class BridgeController: ObservableObject {
      public func setStackPanelOpen(_ open: Bool) async {
          guard stackPanelOpen != open else { return }
          stackPanelOpen = open
@@ -237,7 +281,7 @@
      }
  
      /// Move the six-agent bank shown on the pad. Joystick east/right advances
-@@ -1094,7 +1026,7 @@
+@@ -1016,7 +948,7 @@ public final class BridgeController: ObservableObject {
          lastFingerprint = nil
          Task { [weak self] in
              guard let self else { return }
@@ -246,7 +290,7 @@
          }
      }
  
-@@ -1107,7 +1039,7 @@
+@@ -1029,7 +961,7 @@ public final class BridgeController: ObservableObject {
          do {
              try await HerdrClient.focusAgent(target)
              raiseTerminal()
@@ -255,8 +299,8 @@
          } catch {
              lastError = error.localizedDescription
          }
-@@ -1129,7 +1061,7 @@
-         try await HerdrClient.focusAgent(target.paneID)
+@@ -1045,7 +977,7 @@ public final class BridgeController: ObservableObject {
+         try await HerdrClient.focusAgent(target)
          agentPage = index / agentPageSize
          raiseTerminal()
 -        if isRunning { await refresh() }
@@ -264,251 +308,9 @@
      }
  
      public static var terminalBundleID: String {
---- a/Sources/WLKit/WLDevice.swift
-+++ b/Sources/WLKit/WLDevice.swift
-@@ -89,8 +89,8 @@
-     }
- 
-     // Callbacks, always delivered on the main queue.
--    public var onTX: ((String, Any?, Int) -> Void)?          // queued method, params, id
--    public var onResponse: ((Int, String?, Any?, String?) -> Void)? // id, method, result, error
-+    public var onTX: ((String, Any?, Int) -> Void)?          // method, params, id
-+    public var onResponse: ((Int, Any?, String?) -> Void)?   // id, result, errorMessage
-     public var onNotification: ((String, Any?) -> Void)?     // method, params
-     public var onDeviceLog: ((String) -> Void)?
-     public var onWriteError: ((String, String) -> Void)?
-@@ -113,12 +113,10 @@
-     private var rpcAccumulator = ""
-     private var debugAccumulator = ""
-     private struct PendingCall {
--        var token: UUID
-         var method: String
-         var completion: (Any?, String?) -> Void
-     }
-     private var pending: [Int: PendingCall] = [:]
--    private let writeQueue = HIDWriteQueue()
-     // Multiple non-exclusive clients share replies. A randomized starting id
-     // makes accidental collisions with Codex far less likely than every client
-     // beginning at 1 and advancing in lockstep.
-@@ -244,7 +242,6 @@
-             return
-         }
-         let hadTransport = device != nil || manager != nil
--        writeQueue.invalidateAndDrain()
-         if let dev = device {
-             IOHIDDeviceUnscheduleFromRunLoop(dev, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
-             IOHIDDeviceClose(dev, IOOptionBits(kIOHIDOptionsTypeNone))
-@@ -266,17 +263,6 @@
- 
-     @discardableResult
-     public func call(_ method: String, params: Any?, completion: ((Any?, String?) -> Void)? = nil) -> Int? {
--        callImpl(method, params: params, queued: false, completion: completion)
--    }
--
--    /// Normal async traffic sends reports off-main. Request tables and all
--    /// callbacks stay on main, independently of slow USB/Bluetooth writes.
--    func callQueued(_ method: String, params: Any?, completion: @escaping (Any?, String?) -> Void) -> Int? {
--        callImpl(method, params: params, queued: true, completion: completion)
--    }
--
--    private func callImpl(_ method: String, params: Any?, queued: Bool,
--                          completion: ((Any?, String?) -> Void)?) -> Int? {
-         if emulator == nil && secureInputIsActive() {
-             onSecureInputBlocked?()
-             completion?(nil, Failure.secureInputActive.errorDescription)
-@@ -299,7 +285,7 @@
-             DispatchQueue.main.async { [weak self] in
-                 guard let self else { return }
-                 let (result, error) = emulator.handle(method, params: params)
--                self.onResponse?(id, method, result, error)
-+                self.onResponse?(id, result, error)
-                 completion?(result, error)
-             }
-             return id
-@@ -319,82 +305,44 @@
-         }
- 
-         let payload = [UInt8](data)
--        let requestToken = UUID()
--        if let completion {
--            pending[id] = PendingCall(token: requestToken, method: method, completion: completion)
--            DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
--                guard let self, let waiting = self.pending[id], waiting.token == requestToken else { return }
--                self.pending.removeValue(forKey: id)
--                waiting.completion(nil, Failure.timeout(method).errorDescription)
--            }
--        }
--        onTX?(method, params, id)
--
--        let inputCheck = secureInputIsActive
--        if queued {
--            writeQueue.enqueue { [weak self, dev] generation in
--                let result = Self.writePayload(payload, to: dev, secureInput: inputCheck)
--                guard result != kIOReturnSuccess else { return }
--                DispatchQueue.main.async {
--                    guard let self, self.writeQueue.isCurrent(generation) else { return }
--                    if let result {
--                        self.reportWriteFailure(result, method: method, id: id, token: requestToken)
--                    } else {
--                        self.reportSecureInputBlock(id: id, token: requestToken)
--                    }
--                }
--            }
--            return id
--        }
--        let result = writeQueue.sync { Self.writePayload(payload, to: dev, secureInput: inputCheck) }
--        guard let result else {
--            reportSecureInputBlock(id: id, token: requestToken)
--            return nil
--        }
--        guard result == kIOReturnSuccess else {
--            reportWriteFailure(result, method: method, id: id, token: requestToken)
--            return nil
--        }
--        return id
--    }
--
--    private func reportSecureInputBlock(id: Int, token: UUID) {
--        if let waiting = pending[id], waiting.token == token {
--            pending.removeValue(forKey: id)
--            waiting.completion(nil, Failure.secureInputActive.errorDescription)
--        }
--        onSecureInputBlocked?()
--    }
--
--    private func reportWriteFailure(_ code: IOReturn, method: String, id: Int, token: UUID) {
--        let message = Failure.writeFailed(code).errorDescription ?? "write failed"
--        if let waiting = pending[id], waiting.token == token {
--            pending.removeValue(forKey: id)
--            waiting.completion(nil, message)
--        }
--        onWriteError?(method, message)
--    }
--
--    /// Called only on writeQueue; never touches connection/request state.
--    private static func writePayload(_ payload: [UInt8], to dev: IOHIDDevice,
--                                     secureInput: () -> Bool) -> IOReturn? {
-         var offset = 0
-         while offset < payload.count {
--            // nil is a proactive policy pause, not a fabricated driver error.
--            guard !secureInput() else { return nil }
--            let n = min(maxChunk, payload.count - offset)
--            var report = [UInt8](repeating: 0, count: reportSize)
--            report[0] = reportID
--            report[1] = channelRPC
-+            if secureInputIsActive() {
-+                onSecureInputBlocked?()
-+                completion?(nil, Failure.secureInputActive.errorDescription)
-+                return nil
-+            }
-+            let n = min(WLDevice.maxChunk, payload.count - offset)
-+            var report = [UInt8](repeating: 0, count: WLDevice.reportSize)
-+            report[0] = WLDevice.reportID
-+            report[1] = WLDevice.channelRPC
-             report[2] = UInt8(n)
-             report.replaceSubrange(3..<(3 + n), with: payload[offset..<(offset + n)])
--            let result = report.withUnsafeBufferPointer { buffer in
--                IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, CFIndex(reportID), buffer.baseAddress!, buffer.count)
--            }
--            guard result == kIOReturnSuccess else { return result }
-+
-+            let rc = report.withUnsafeBufferPointer { buf in
-+                IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, CFIndex(WLDevice.reportID), buf.baseAddress!, buf.count)
-+            }
-+            guard rc == kIOReturnSuccess else {
-+                // Surface the failure rather than dropping it: a silent write
-+                // error is indistinguishable from a device that ignores you.
-+                let message = Failure.writeFailed(rc).errorDescription ?? "write failed"
-+                onWriteError?(method, message)
-+                completion?(nil, message)
-+                return nil
-+            }
-             offset += n
-         }
--        return kIOReturnSuccess
-+
-+        onTX?(method, params, id)
-+
-+        if let completion {
-+            pending[id] = PendingCall(method: method, completion: completion)
-+            DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
-+                guard let self, let waiting = self.pending.removeValue(forKey: id) else { return }
-+                waiting.completion(nil, Failure.timeout(method).errorDescription)
-+            }
-+        }
-+        return id
-     }
- 
-     // MARK: - Receive
-@@ -445,7 +393,7 @@
-             if let id = decoded["id"] as? Int {
-                 let error = (decoded["error"] as? [String: Any])?["message"] as? String
-                 let result = decoded["result"]
--                onResponse?(id, decoded["method"] as? String, result, error)
-+                onResponse?(id, result, error)
-                 if let waiting = pending[id] {
-                     // Responses normally echo the method. If another shared
-                     // client happens to reuse our numeric id, do not resolve a
---- a/Sources/WLKit/WLDevice+Async.swift
-+++ b/Sources/WLKit/WLDevice+Async.swift
-@@ -1,9 +1,12 @@
- import Foundation
- 
- extension WLDevice {
--    /// Async request bookkeeping lives on main alongside input callbacks;
--    /// actual report writes run on the device's serial background write queue.
--    /// Slow lighting writes therefore cannot block handling a button or dial.
-+    /// async/await over the completion-based `call`.
-+    ///
-+    /// Hops to the main queue first: `call` touches the pending-request table
-+    /// and schedules its timeout there, and input reports are delivered there
-+    /// too, so keeping every access on one queue is what makes the table safe
-+    /// without locking.
-     public func callAsync(_ method: String, params: Any? = nil) async throws -> Any? {
-         try await withCheckedThrowingContinuation { continuation in
-             var resumed = false
-@@ -13,7 +16,7 @@
-                 continuation.resume(with: result)
-             }
-             DispatchQueue.main.async {
--                let sent = self.callQueued(method, params: params) { result, error in
-+                let sent = self.call(method, params: params) { result, error in
-                     if let error {
-                         finish(.failure(WLDevice.Failure.rpc(method, error)))
-                     } else {
-@@ -21,8 +24,8 @@
-                     }
-                 }
-                 if sent == nil {
--                    // A request can be refused before queueing; the completion
--                    // already carried the
-+                    // `call` refuses before sending when there is no device or
-+                    // the write fails; the completion already carried the
-                     // reason, so this only covers the silent case.
-                     finish(.failure(WLDevice.Failure.notConnected))
-                 }
---- a/Sources/WLInspector/AppModel.swift
-+++ b/Sources/WLInspector/AppModel.swift
-@@ -80,7 +80,7 @@
-         device.onTX = { [weak self] method, params, id in
-             self?.log(.tx, "\(method)  #\(id)", self?.encode(params) ?? "")
-         }
--        device.onResponse = { [weak self] id, _, result, error in
-+        device.onResponse = { [weak self] id, result, error in
-             guard let self else { return }
-             if let error {
-                 self.log(.error, "response #\(id)", error)
---- a/Sources/WLLayerProbe/main.swift
-+++ b/Sources/WLLayerProbe/main.swift
-@@ -232,7 +232,7 @@
-             var foreignResponses = 0
-             var issuedIDs = Set<Int>()
-             device.onTX = { _, _, id in issuedIDs.insert(id) }
--            device.onResponse = { id, _, _, _ in
-+            device.onResponse = { id, _, _ in
-                 if issuedIDs.remove(id) == nil { foreignResponses += 1 }
-             }
-             device.onNotification = { method, params in
+diff --git a/Sources/WLKit/HIDWriteQueue.swift b/Sources/WLKit/HIDWriteQueue.swift
+deleted file mode 100644
+index 6f2f547..0000000
 --- a/Sources/WLKit/HIDWriteQueue.swift
 +++ /dev/null
 @@ -1,38 +0,0 @@
@@ -550,6 +352,9 @@
 -        queue.sync {}
 -    }
 -}
+diff --git a/Sources/WLKit/PadLightingCache.swift b/Sources/WLKit/PadLightingCache.swift
+deleted file mode 100644
+index 4666459..0000000
 --- a/Sources/WLKit/PadLightingCache.swift
 +++ /dev/null
 @@ -1,48 +0,0 @@
@@ -601,6 +406,247 @@
 -        return true
 -    }
 -}
+diff --git a/Sources/WLKit/WLDevice+Async.swift b/Sources/WLKit/WLDevice+Async.swift
+index 634484a..628f200 100644
+--- a/Sources/WLKit/WLDevice+Async.swift
++++ b/Sources/WLKit/WLDevice+Async.swift
+@@ -1,9 +1,12 @@
+ import Foundation
+ 
+ extension WLDevice {
+-    /// Async request bookkeeping lives on main alongside input callbacks;
+-    /// actual report writes run on the device's serial background write queue.
+-    /// Slow lighting writes therefore cannot block handling a button or dial.
++    /// async/await over the completion-based `call`.
++    ///
++    /// Hops to the main queue first: `call` touches the pending-request table
++    /// and schedules its timeout there, and input reports are delivered there
++    /// too, so keeping every access on one queue is what makes the table safe
++    /// without locking.
+     public func callAsync(_ method: String, params: Any? = nil) async throws -> Any? {
+         try await withCheckedThrowingContinuation { continuation in
+             var resumed = false
+@@ -13,7 +16,7 @@ extension WLDevice {
+                 continuation.resume(with: result)
+             }
+             DispatchQueue.main.async {
+-                let sent = self.callQueued(method, params: params) { result, error in
++                let sent = self.call(method, params: params) { result, error in
+                     if let error {
+                         finish(.failure(WLDevice.Failure.rpc(method, error)))
+                     } else {
+@@ -21,8 +24,8 @@ extension WLDevice {
+                     }
+                 }
+                 if sent == nil {
+-                    // A request can be refused before queueing; the completion
+-                    // already carried the
++                    // `call` refuses before sending when there is no device or
++                    // the write fails; the completion already carried the
+                     // reason, so this only covers the silent case.
+                     finish(.failure(WLDevice.Failure.notConnected))
+                 }
+diff --git a/Sources/WLKit/WLDevice.swift b/Sources/WLKit/WLDevice.swift
+index f168480..aa1d8f6 100644
+--- a/Sources/WLKit/WLDevice.swift
++++ b/Sources/WLKit/WLDevice.swift
+@@ -89,8 +89,8 @@ public final class WLDevice {
+     }
+ 
+     // Callbacks, always delivered on the main queue.
+-    public var onTX: ((String, Any?, Int) -> Void)?          // queued method, params, id
+-    public var onResponse: ((Int, String?, Any?, String?) -> Void)? // id, method, result, error
++    public var onTX: ((String, Any?, Int) -> Void)?          // method, params, id
++    public var onResponse: ((Int, Any?, String?) -> Void)?   // id, result, errorMessage
+     public var onNotification: ((String, Any?) -> Void)?     // method, params
+     public var onDeviceLog: ((String) -> Void)?
+     public var onWriteError: ((String, String) -> Void)?
+@@ -113,12 +113,10 @@ public final class WLDevice {
+     private var rpcAccumulator = ""
+     private var debugAccumulator = ""
+     private struct PendingCall {
+-        var token: UUID
+         var method: String
+         var completion: (Any?, String?) -> Void
+     }
+     private var pending: [Int: PendingCall] = [:]
+-    private let writeQueue = HIDWriteQueue()
+     // Multiple non-exclusive clients share replies. A randomized starting id
+     // makes accidental collisions with Codex far less likely than every client
+     // beginning at 1 and advancing in lockstep.
+@@ -244,7 +242,6 @@ public final class WLDevice {
+             return
+         }
+         let hadTransport = device != nil || manager != nil
+-        writeQueue.invalidateAndDrain()
+         if let dev = device {
+             IOHIDDeviceUnscheduleFromRunLoop(dev, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+             IOHIDDeviceClose(dev, IOOptionBits(kIOHIDOptionsTypeNone))
+@@ -266,17 +263,6 @@ public final class WLDevice {
+ 
+     @discardableResult
+     public func call(_ method: String, params: Any?, completion: ((Any?, String?) -> Void)? = nil) -> Int? {
+-        callImpl(method, params: params, queued: false, completion: completion)
+-    }
+-
+-    /// Normal async traffic sends reports off-main. Request tables and all
+-    /// callbacks stay on main, independently of slow USB/Bluetooth writes.
+-    func callQueued(_ method: String, params: Any?, completion: @escaping (Any?, String?) -> Void) -> Int? {
+-        callImpl(method, params: params, queued: true, completion: completion)
+-    }
+-
+-    private func callImpl(_ method: String, params: Any?, queued: Bool,
+-                          completion: ((Any?, String?) -> Void)?) -> Int? {
+         if emulator == nil && secureInputIsActive() {
+             onSecureInputBlocked?()
+             completion?(nil, Failure.secureInputActive.errorDescription)
+@@ -299,7 +285,7 @@ public final class WLDevice {
+             DispatchQueue.main.async { [weak self] in
+                 guard let self else { return }
+                 let (result, error) = emulator.handle(method, params: params)
+-                self.onResponse?(id, method, result, error)
++                self.onResponse?(id, result, error)
+                 completion?(result, error)
+             }
+             return id
+@@ -319,82 +305,44 @@ public final class WLDevice {
+         }
+ 
+         let payload = [UInt8](data)
+-        let requestToken = UUID()
+-        if let completion {
+-            pending[id] = PendingCall(token: requestToken, method: method, completion: completion)
+-            DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+-                guard let self, let waiting = self.pending[id], waiting.token == requestToken else { return }
+-                self.pending.removeValue(forKey: id)
+-                waiting.completion(nil, Failure.timeout(method).errorDescription)
++        var offset = 0
++        while offset < payload.count {
++            if secureInputIsActive() {
++                onSecureInputBlocked?()
++                completion?(nil, Failure.secureInputActive.errorDescription)
++                return nil
+             }
+-        }
+-        onTX?(method, params, id)
++            let n = min(WLDevice.maxChunk, payload.count - offset)
++            var report = [UInt8](repeating: 0, count: WLDevice.reportSize)
++            report[0] = WLDevice.reportID
++            report[1] = WLDevice.channelRPC
++            report[2] = UInt8(n)
++            report.replaceSubrange(3..<(3 + n), with: payload[offset..<(offset + n)])
+ 
+-        let inputCheck = secureInputIsActive
+-        if queued {
+-            writeQueue.enqueue { [weak self, dev] generation in
+-                let result = Self.writePayload(payload, to: dev, secureInput: inputCheck)
+-                guard result != kIOReturnSuccess else { return }
+-                DispatchQueue.main.async {
+-                    guard let self, self.writeQueue.isCurrent(generation) else { return }
+-                    if let result {
+-                        self.reportWriteFailure(result, method: method, id: id, token: requestToken)
+-                    } else {
+-                        self.reportSecureInputBlock(id: id, token: requestToken)
+-                    }
+-                }
++            let rc = report.withUnsafeBufferPointer { buf in
++                IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, CFIndex(WLDevice.reportID), buf.baseAddress!, buf.count)
+             }
+-            return id
+-        }
+-        let result = writeQueue.sync { Self.writePayload(payload, to: dev, secureInput: inputCheck) }
+-        guard let result else {
+-            reportSecureInputBlock(id: id, token: requestToken)
+-            return nil
+-        }
+-        guard result == kIOReturnSuccess else {
+-            reportWriteFailure(result, method: method, id: id, token: requestToken)
+-            return nil
+-        }
+-        return id
+-    }
+-
+-    private func reportSecureInputBlock(id: Int, token: UUID) {
+-        if let waiting = pending[id], waiting.token == token {
+-            pending.removeValue(forKey: id)
+-            waiting.completion(nil, Failure.secureInputActive.errorDescription)
++            guard rc == kIOReturnSuccess else {
++                // Surface the failure rather than dropping it: a silent write
++                // error is indistinguishable from a device that ignores you.
++                let message = Failure.writeFailed(rc).errorDescription ?? "write failed"
++                onWriteError?(method, message)
++                completion?(nil, message)
++                return nil
++            }
++            offset += n
+         }
+-        onSecureInputBlocked?()
+-    }
+ 
+-    private func reportWriteFailure(_ code: IOReturn, method: String, id: Int, token: UUID) {
+-        let message = Failure.writeFailed(code).errorDescription ?? "write failed"
+-        if let waiting = pending[id], waiting.token == token {
+-            pending.removeValue(forKey: id)
+-            waiting.completion(nil, message)
+-        }
+-        onWriteError?(method, message)
+-    }
++        onTX?(method, params, id)
+ 
+-    /// Called only on writeQueue; never touches connection/request state.
+-    private static func writePayload(_ payload: [UInt8], to dev: IOHIDDevice,
+-                                     secureInput: () -> Bool) -> IOReturn? {
+-        var offset = 0
+-        while offset < payload.count {
+-            // nil is a proactive policy pause, not a fabricated driver error.
+-            guard !secureInput() else { return nil }
+-            let n = min(maxChunk, payload.count - offset)
+-            var report = [UInt8](repeating: 0, count: reportSize)
+-            report[0] = reportID
+-            report[1] = channelRPC
+-            report[2] = UInt8(n)
+-            report.replaceSubrange(3..<(3 + n), with: payload[offset..<(offset + n)])
+-            let result = report.withUnsafeBufferPointer { buffer in
+-                IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, CFIndex(reportID), buffer.baseAddress!, buffer.count)
++        if let completion {
++            pending[id] = PendingCall(method: method, completion: completion)
++            DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
++                guard let self, let waiting = self.pending.removeValue(forKey: id) else { return }
++                waiting.completion(nil, Failure.timeout(method).errorDescription)
+             }
+-            guard result == kIOReturnSuccess else { return result }
+-            offset += n
+         }
+-        return kIOReturnSuccess
++        return id
+     }
+ 
+     // MARK: - Receive
+@@ -445,7 +393,7 @@ public final class WLDevice {
+             if let id = decoded["id"] as? Int {
+                 let error = (decoded["error"] as? [String: Any])?["message"] as? String
+                 let result = decoded["result"]
+-                onResponse?(id, decoded["method"] as? String, result, error)
++                onResponse?(id, result, error)
+                 if let waiting = pending[id] {
+                     // Responses normally echo the method. If another shared
+                     // client happens to reuse our numeric id, do not resolve a
+diff --git a/Sources/WLLayerProbe/main.swift b/Sources/WLLayerProbe/main.swift
+index 970bdf3..88a85a6 100644
+--- a/Sources/WLLayerProbe/main.swift
++++ b/Sources/WLLayerProbe/main.swift
+@@ -232,7 +232,7 @@ struct WLLayerProbe {
+             var foreignResponses = 0
+             var issuedIDs = Set<Int>()
+             device.onTX = { _, _, id in issuedIDs.insert(id) }
+-            device.onResponse = { id, _, _, _ in
++            device.onResponse = { id, _, _ in
+                 if issuedIDs.remove(id) == nil { foreignResponses += 1 }
+             }
+             device.onNotification = { method, params in
+diff --git a/Tests/WLKitTests/InputResponsivenessTests.swift b/Tests/WLKitTests/InputResponsivenessTests.swift
+deleted file mode 100644
+index fbc8d56..0000000
 --- a/Tests/WLKitTests/InputResponsivenessTests.swift
 +++ /dev/null
 @@ -1,185 +0,0 @@
@@ -789,30 +835,3 @@
 -        #expect(cache.delta(for: picture).zonesChanged)
 -    }
 -}
---- a/README.md
-+++ b/README.md
-@@ -380,16 +380,6 @@
- the physical switch and another client's writes are not atomic with our poll.
- No keypresses, app activation, or keymap writes are used for the clear.
- 
--**Deferred latency experiment (not installed).** Normal RPC report writes run on a serial
--background queue, keeping the main queue available for button/dial input. Each
--JSON message stays contiguous on the wire. Lighting keeps only the latest pending
--picture and waits for 120 ms of input quiet before painting; the resulting small
--lighting delay is intentional. Only changed keys/zones are sent, so changing the
--ring does not resend all keys. Another client's read-only status replies do not
--invalidate lighting. Reconnects and explicit Refresh still restore a full picture.
--Synchronous off/sleep flushing remains serialized with queued writes, and a
--transport is not closed until its current message finishes.
--
- **Known limitation:** Codex itself does not check the layer for `AG00`–`AG05`.
- Double-pressing one of those keys can still bring Codex forward, even on Layer 2.
- The current mapping intentionally retains those codes; shared HID access cannot
-@@ -405,7 +395,6 @@
- ./scripts/test-swift-suite.sh AgentLightingTests
- ./scripts/test-swift-suite.sh HerdrFocusTests
- ./scripts/test-swift-suite.sh SecureInputTests
--./scripts/test-swift-suite.sh InputResponsivenessTests
- ./scripts/test-dictation-media.sh
- swift run WLInspector  # the debug UI
- ./scripts/bundle.sh    # assemble build/MicroManager.app, unsigned install

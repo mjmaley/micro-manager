@@ -32,7 +32,7 @@ enum MenuBarIcon {
             if !bridge.hardwareInputReady { return .validating }
             guard let state = bridge.aggregateState else { return .idle }
             switch state {
-            case "blocked": return .blocked
+            case "blocked", "error": return .blocked
             case "working": return .working
             default: return .allIdle
             }

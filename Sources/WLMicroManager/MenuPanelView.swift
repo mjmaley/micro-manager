@@ -197,7 +197,9 @@ struct MenuPanelView: View {
         if let macroText { return "Type: \(macroText)" }
         if isVoiceKey { return "Command+/ — start or stop OpenWhispr" }
         if isSubmitKey { return "Submit — send Enter to the focused Herdr pane" }
-        if let agent { return "\(agent.shortName) — \(agent.status)" }
+        if let agent {
+            return "\(agent.shortName) · \(agent.machineLabel) — \(agent.status)"
+        }
         return "Key \(index)"
     }
 
@@ -224,7 +226,7 @@ struct MenuPanelView: View {
                     .padding(.horizontal, 14).padding(.top, 6)
                 }
                 ForEach(Array(bridge.visibleAgents.enumerated()), id: \.offset) { index, agent in
-                    let lightState = bridge.lightingStateForVisibleSlot(index) ?? agent.status
+                    let lightState = agent.status
                     Button {
                         Task { await bridge.focusSlot(index) }
                     } label: {
@@ -235,7 +237,13 @@ struct MenuPanelView: View {
                             Text("\(index)")
                                 .font(.system(.caption, design: .monospaced))
                                 .foregroundStyle(.tertiary)
-                            Text(agent.shortName).lineLimit(1)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(agent.shortName).lineLimit(1)
+                                Text(agent.machineLabel)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
                             Spacer(minLength: 8)
                             Text(lightState == "done" ? "finished" : lightState == "idle" ? "idle / seen" : lightState)
                                 .font(.caption)
@@ -245,11 +253,12 @@ struct MenuPanelView: View {
                         .padding(.horizontal, 14).padding(.vertical, 5)
                     }
                     .buttonStyle(.plain)
+                    .help("\(agent.shortName) · \(agent.machineLabel) — \(agent.status)")
                     .contextMenu {
                         Button("Test notification for this agent (5s)") {
-                            Task { await notifications.sendTest(paneID: agent.paneID) }
+                            Task { await notifications.sendTest(target: agent.focusTarget) }
                         }
-                        .disabled(!notifications.enabled || agent.paneID == nil)
+                        .disabled(!notifications.enabled || agent.focusTarget == nil)
                     }
                 }
                 .padding(.vertical, 4)

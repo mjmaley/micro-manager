@@ -4,19 +4,14 @@ import IOKit
 import IOKit.hid
 import OSLog
 
-/// Drives the pad from Herdr agent status: each agent gets its own key, with
-/// completion acknowledgement tracking, and the underglow follows the selected
-/// agent. The menu-bar icon retains the raw worst-state aggregate.
+/// Drives the pad from Herdr agent status: each agent gets its own key, lit
+/// by herdr-core's reported status and the Herdr app's read tracking, and the
+/// underglow follows the agent in the app's focused pane. The menu-bar icon
+/// retains the worst-state aggregate.
 ///
-/// Liveness comes from three places, so a missed event can never leave the pad
-/// showing something stale:
-///   1. a lifecycle stream (panes appearing, disappearing, gaining agents)
-///   2. one status stream per agent pane (instant transitions)
-///   3. a slow poll of `agent.list` as a backstop
-///
-/// `agent.list` is always the source of truth; events only decide *when* to
-/// look. This is a port of `bin/leds.js` — including the parts that were bug
-/// fixes, which are called out where they matter.
+/// Agents are re-read on a short poll and whenever the frontmost app changes;
+/// each read is the complete truth, so a missed change never leaves the pad
+/// showing something stale for longer than one poll.
 @MainActor
 public final class BridgeController: ObservableObject {
 
@@ -40,8 +35,6 @@ public final class BridgeController: ObservableObject {
     @Published public private(set) var keyColors: [Int: Color] = [:]
     @Published public private(set) var keyEffects: [Int: OAI.Effect] = [:]
     @Published public private(set) var aggregateState: String?
-    /// Lighting-only completion/read state; raw agent statuses stay unchanged.
-    @Published public private(set) var agentLighting = AgentLightingSnapshot(states: [], selectedState: nil)
     @Published public private(set) var lastError: String?
     /// Another process is talking to the same pad. A shared HID open means we
     /// receive its replies too, so a response id we never issued is a reliable
@@ -77,12 +70,6 @@ public final class BridgeController: ObservableObject {
         return "\(start + 1)–\(end) of \(agents.count)"
     }
 
-    public func lightingStateForVisibleSlot(_ slot: Int) -> String? {
-        let index = agentPage * agentPageSize + slot
-        guard slot >= 0, slot < agentPageSize, index < agentLighting.states.count else { return nil }
-        return agentLighting.states[index]
-    }
-
     public var config: BridgeConfig
     /// Text macros for the spare keys, reloaded on every bridge start so a
     /// config edit only needs an off/on toggle, not a relaunch.
@@ -111,7 +98,7 @@ public final class BridgeController: ObservableObject {
     /// key into "cancel" without those keys also doing their usual work.
     public var onKeyIntercept: ((Int) -> Bool)?
     /// Successful, current Herdr snapshots, independent of HID connectivity.
-    public var onAgentSnapshot: (([HerdrAgent], String) -> Void)?
+    public var onAgentSnapshot: (([HerdrAgent]) -> Void)?
     public var onAgentObservationReset: (() -> Void)?
 
     // MARK: - Internals
@@ -119,8 +106,6 @@ public final class BridgeController: ObservableObject {
     private var device = WLDevice()
     /// Non-nil while the bridge is driving a virtual pad instead of hardware.
     @Published public private(set) var emulator: PadEmulator?
-    private var lifecycle: HerdrEventStream?
-    private var statusStreams: [String: HerdrEventStream] = [:]
     private var pollTask: Task<Void, Never>?
     private var layerMonitorTask: Task<Void, Never>?
     private var debounceTask: Task<Void, Never>?
@@ -141,7 +126,6 @@ public final class BridgeController: ObservableObject {
     private var lightingTask: Task<Void, Never>?
     private var lightingWorkerGeneration: UInt64 = 0
     private var lastInputAt: TimeInterval = -.infinity
-    private var agentLightingTracker = AgentLightingTracker()
     private var terminalActivationObserver: NSObjectProtocol?
     private var lastPublishedFingerprint: String?
     private var issuedIDs = Set<Int>()
@@ -285,7 +269,7 @@ public final class BridgeController: ObservableObject {
         startSecureInputMonitor()
 
         await openDevice()
-        startLifecycleStream()
+        startFocusObservation()
         await refresh(forcePaint: true)
         startLayerMonitor()
 
@@ -301,7 +285,6 @@ public final class BridgeController: ObservableObject {
         secureInputApplication = nil
         layerLighting.reset()
         resetLightingOutput()
-        agentLightingTracker.reset()
         stopFocusObservation()
         snapshotSequence += 1
         onAgentObservationReset?()
@@ -315,9 +298,6 @@ public final class BridgeController: ObservableObject {
         wideKeysDown.removeAll()
         lastSubmitPressAt = nil
         issuedIDs.removeAll()
-        lifecycle?.stop(); lifecycle = nil
-        statusStreams.values.forEach { $0.stop() }
-        statusStreams.removeAll()
         lastFingerprint = nil
         lastPublishedFingerprint = nil
 
@@ -335,7 +315,6 @@ public final class BridgeController: ObservableObject {
         keyColors = [:]
         keyEffects = [:]
         aggregateState = nil
-        agentLighting = AgentLightingSnapshot(states: [], selectedState: nil)
         agents = []
         agentPage = 0
     }
@@ -353,7 +332,6 @@ public final class BridgeController: ObservableObject {
         secureInputTask?.cancel(); secureInputTask = nil
         layerLighting.reset()
         resetLightingOutput()
-        agentLightingTracker.endViewing()
         stopFocusObservation()
         snapshotSequence += 1
         onAgentObservationReset?()
@@ -363,9 +341,6 @@ public final class BridgeController: ObservableObject {
         debounceTask?.cancel(); debounceTask = nil
         reopenTask?.cancel(); reopenTask = nil
         wakeTask?.cancel(); wakeTask = nil
-        lifecycle?.stop(); lifecycle = nil
-        statusStreams.values.forEach { $0.stop() }
-        statusStreams.removeAll()
         wideKeysDown.removeAll()
         lastSubmitPressAt = nil
 
@@ -398,7 +373,7 @@ public final class BridgeController: ObservableObject {
             guard let self, self.isRunning, !self.suspendedForSystemInactivity else { return }
             self.wakeTask = nil
             await self.openDevice()
-            self.startLifecycleStream()
+            self.startFocusObservation()
             self.startLayerMonitor()
             self.startPoll()
             if self.deviceConnected { await self.forceRepaint() }
@@ -672,31 +647,7 @@ public final class BridgeController: ObservableObject {
         return active
     }
 
-    // MARK: - Herdr events
-
-    private func startLifecycleStream() {
-        guard isRunning, !suspendedForSystemInactivity else { return }
-        startFocusObservation()
-        let stream = HerdrEventStream(subscriptions: [
-            ["type": "pane.focused"],
-            ["type": "tab.focused"],
-            ["type": "workspace.focused"],
-            ["type": "pane.created"],
-            ["type": "pane.closed"],
-            ["type": "pane.exited"],
-            ["type": "pane.agent_detected"],
-        ])
-        stream.onEvent = { [weak self] _ in self?.schedule() }
-        stream.onClosed = { [weak self] _ in
-            guard let self, self.isRunning else { return }
-            self.lifecycle = nil
-            Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-                self?.startLifecycleStream()
-            }
-        }
-        lifecycle = stream.start()
-    }
+    // MARK: - Herdr focus observation
 
     private func startFocusObservation() {
         guard terminalActivationObserver == nil else { return }
@@ -705,7 +656,6 @@ public final class BridgeController: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, self.isRunning, !self.suspendedForSystemInactivity else { return }
-                if !Self.terminalIsActive { self.agentLightingTracker.endViewing() }
                 self.schedule() // Refresh pane focus; never infer it from a pad slot.
             }
         }
@@ -718,25 +668,6 @@ public final class BridgeController: ObservableObject {
         terminalActivationObserver = nil
     }
 
-    /// One dedicated stream per agent pane: a subscription owns its connection
-    /// and cannot be extended after the fact.
-    private func reconcileStatusStreams(_ agents: [HerdrAgent]) {
-        let wanted = Set(agents.compactMap(\.paneID))
-        for (paneID, stream) in statusStreams where !wanted.contains(paneID) {
-            stream.stop()
-            statusStreams.removeValue(forKey: paneID)
-        }
-        for paneID in wanted where statusStreams[paneID] == nil {
-            let stream = HerdrEventStream(subscriptions: [
-                ["type": "pane.agent_status_changed", "pane_id": paneID],
-            ])
-            stream.onEvent = { [weak self] _ in self?.schedule() }
-            stream.onClosed = { [weak self] _ in
-                self?.statusStreams.removeValue(forKey: paneID)
-            }
-            statusStreams[paneID] = stream.start()
-        }
-    }
 
     private func schedule() {
         guard debounceTask == nil else { return }
@@ -762,41 +693,33 @@ public final class BridgeController: ObservableObject {
         snapshotSequence += 1
         let sequence = snapshotSequence
         if updateLayer { _ = await updateDeviceStatus() }
-        let socket = HerdrClient.socketPath()
-        let identity = AgentNotificationTarget.socketIdentity(at: socket)
 
         let fetched: [HerdrAgent]
+        let observationSucceeded: Bool
+        let observationError: String?
         do {
-            fetched = try await HerdrClient.listAgents()
+            let snapshot = try await HerdrClient.snapshot()
+            fetched = snapshot.agents
+            observationSucceeded = true
+            observationError = snapshot.warning
         } catch {
             guard sequence == snapshotSequence else { return }
-            onAgentObservationReset?()
-            lastError = error.localizedDescription
-            return
+            fetched = []
+            observationSucceeded = false
+            observationError = error.localizedDescription
         }
         guard sequence == snapshotSequence, isRunning, !suspendedForSystemInactivity else { return }
-        let stableIdentity = identity.flatMap {
-            $0 == AgentNotificationTarget.socketIdentity(at: socket) ? $0 : nil
-        }
-        if let stableIdentity {
-            onAgentSnapshot?(fetched, stableIdentity)
-        } else {
-            onAgentObservationReset?()
-        }
-        if lastError != nil { lastError = nil }
+        if observationSucceeded { onAgentSnapshot?(fetched) }
+        else { onAgentObservationReset?() }
+        if lastError != observationError { lastError = observationError }
         if agents != fetched { agents = fetched }
         let validPage = min(agentPage, agentPageCount - 1)
         if agentPage != validPage { agentPage = validPage }
-        reconcileStatusStreams(fetched)
 
-        let lighting = agentLightingTracker.consume(fetched, socketPath: socket,
-                                                     socketIdentity: stableIdentity,
-                                                     terminalActive: Self.terminalIsActive)
-        if agentLighting != lighting { agentLighting = lighting }
+        let selectedState = fetched.first(where: \.focused)?.status
         let aggregate = StatusMapper.aggregate(fetched, config)
         if aggregateState != aggregate { aggregateState = aggregate }
         let pageAgents = visibleAgents
-        let pageStates = Array(lighting.states.dropFirst(agentPage * agentPageSize).prefix(agentPageSize))
         // Macro and voice keys share ids, so the binding decides each key's
         // light: configured text wins, the wide key falls back to voice.
         let flexKeys = (Pad.macroKeyIDs + Pad.voiceKeyIDs).map { key -> OAI.Thread in
@@ -812,8 +735,7 @@ public final class BridgeController: ObservableObject {
         let threads = StatusMapper.threads(
             for: pageAgents,
             config,
-            agentKeyIDs: padConfiguration.agentKeyIDs,
-            lightingStates: pageStates
+            agentKeyIDs: padConfiguration.agentKeyIDs
         )
             + [StatusMapper.piActionThread(id: Pad.fastKeyID, color: config.fastColor, config),
                StatusMapper.piActionThread(id: Pad.approveKeyID, color: config.approveColor, config),
@@ -825,7 +747,7 @@ public final class BridgeController: ObservableObject {
         // agent's ring state (which can belong to an off-page agent).
         let fingerprint = threads.map { thread in
             "\(thread.id):\(thread.color ?? -1):\(thread.effect?.rawValue ?? -1):\(thread.brightness ?? -1)"
-        }.joined(separator: "|") + "|ring:\(lighting.selectedState ?? "-")"
+        }.joined(separator: "|") + "|ring:\(selectedState ?? "-")"
 
         if fingerprint != lastPublishedFingerprint {
             lastPublishedFingerprint = fingerprint
@@ -841,7 +763,7 @@ public final class BridgeController: ObservableObject {
         }
         guard forcePaint || fingerprint != lastFingerprint else { return }
         lastFingerprint = fingerprint
-        await apply(state: lighting.selectedState, threads: threads)
+        await apply(state: selectedState, threads: threads)
     }
 
     private func publishKeyState(_ threads: [OAI.Thread]) {
@@ -1022,12 +944,12 @@ public final class BridgeController: ObservableObject {
     public func submitFocusedPane() async {
         do {
             guard let agent = try await HerdrClient.focusedAgent(),
-                  let pane = agent.paneID
+                  let target = agent.focusTarget
             else {
                 lastError = "Nothing has focus in Herdr right now."
                 return
             }
-            try await HerdrClient.sendKeys(paneID: pane, keys: ["enter"])
+            try await HerdrClient.sendKeys(target: target, keys: ["enter"])
         } catch {
             lastError = error.localizedDescription
         }
@@ -1038,12 +960,12 @@ public final class BridgeController: ObservableObject {
     public func injectPrompt(_ text: String) async {
         do {
             guard let agent = try await HerdrClient.focusedAgent(),
-                  let pane = agent.paneID
+                  let target = agent.focusTarget
             else {
                 lastError = "Nothing has focus in Herdr right now."
                 return
             }
-            try await HerdrClient.sendText(paneID: pane, text: text)
+            try await HerdrClient.typeText(target: target, text: text)
         } catch {
             lastError = error.localizedDescription
         }
@@ -1062,7 +984,7 @@ public final class BridgeController: ObservableObject {
         lastError = message
     }
 
-    /// Advances the focused workspace to its next tab, wrapping.
+    /// Shows the next tab of the Herdr app's current space.
     public func cycleTabs() async {
         do {
             try await HerdrClient.cycleTabs()
@@ -1115,18 +1037,12 @@ public final class BridgeController: ObservableObject {
 
     /// Validate against a fresh snapshot before honoring an OS notification.
     /// This also works when the hardware bridge is off or the pad is unplugged.
-    public func focusNotificationTarget(_ target: AgentNotificationTarget) async throws {
-        let socket = HerdrClient.socketPath()
-        guard target.socketPath == socket,
-              target.socketIdentity == AgentNotificationTarget.socketIdentity(at: socket) else {
-            throw HerdrError.api("This notification belongs to a previous or different Herdr server.")
-        }
+    public func focusNotificationTarget(_ target: HerdrAgentTarget) async throws {
         let current = try await HerdrClient.listAgents()
-        guard let index = current.firstIndex(where: { target.matches($0) }),
-              target.socketIdentity == AgentNotificationTarget.socketIdentity(at: socket) else {
+        guard let index = current.firstIndex(where: { target.matches($0) }) else {
             throw HerdrError.api("The agent pane for this notification is no longer available.")
         }
-        try await HerdrClient.focusAgent(target.paneID)
+        try await HerdrClient.focusAgent(target)
         agentPage = index / agentPageSize
         raiseTerminal()
         if isRunning { await refresh() }
@@ -1142,8 +1058,8 @@ public final class BridgeController: ObservableObject {
     }
 
     /// The app Herdr's panes live in. Override with `WL_TERMINAL_BUNDLE_ID` if
-    /// they live somewhere other than Ghostty.
-    public static let defaultTerminalBundleID = "com.mitchellh.ghostty"
+    /// they live somewhere other than the Herdr desktop app.
+    public static let defaultTerminalBundleID = "dev.herdr.app"
 
     /// Brings the terminal forward unless it is already the active app.
     ///

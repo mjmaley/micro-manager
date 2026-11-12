@@ -144,6 +144,13 @@ final class LandPanelController {
                 message: "Nothing has focus in Herdr right now."
             )
         }
+        guard agent.isLocalMachine else {
+            return .blocked(
+                title: agent.shortName,
+                subtitle: agent.machineLabel,
+                message: "The Land panel supports local checkouts only. Remote filesystem and GitButler commands are not supported."
+            )
+        }
         guard let directory = agent.workingDirectory else {
             return .blocked(
                 title: agent.shortName,

@@ -1,32 +1,37 @@
 import Foundation
 
-/// Client for the Herdr socket API: newline-delimited JSON over a Unix socket.
-///
-/// The server handles **exactly one request per connection** and then closes,
-/// with one exception: `events.subscribe` takes over the stream and pushes
-/// events until the client disconnects. So a request opens a short-lived
-/// connection, and each subscription owns a dedicated long-lived one. A client
-/// that reuses a connection for a second request simply never hears back.
-
+/// One herdr-core terminal whose program reports an OSC 7501 status. Shells
+/// and programs that never reported are not agents.
 public struct HerdrAgent: Equatable, Sendable {
-    public var terminalID: String?
+    /// `t7` on this computer, `machine/t7` on a connected machine.
+    public var address: String
+    /// With the address, identifies one occupant; herdr-core never reuses
+    /// an address, but a re-added machine name could.
+    public var createdMs: Int64?
+    /// The Herdr app pane showing it, if any.
     public var paneID: String?
-    public var tabID: String?
-    public var workspaceID: String?
+    /// The program's own name for itself (`omp`, `claude-code`, `codex`).
     public var agent: String
+    /// idle, working, blocked, done, error, or unknown. `done` means finished
+    /// and not yet seen in the Herdr app; once seen it reads `idle`, as in the
+    /// app's own lists.
     public var status: String
     public var cwd: String?
     public var foregroundCwd: String?
+    /// The focused pane of the Herdr app shows this agent.
     public var focused: Bool
 
-    /// Visible navigation requires the pane id, not the terminal/session id.
-    /// Do not guess a target when a server omits the pane identity.
-    public var focusTarget: String? {
-        paneID.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+    /// The core's name for the machine, or nil for this computer.
+    public var machineName: String? {
+        address.firstIndex(of: "/").map { String(address[..<$0]) }
     }
+    public var isLocalMachine: Bool { machineName == nil }
+    public var machineLabel: String { machineName ?? "This computer" }
 
-    /// Where the agent is actually working. `foreground_cwd` follows a `cd`
-    /// inside the pane; `cwd` is only where the pane started.
+    public var focusTarget: HerdrAgentTarget? { HerdrAgentTarget(agent: self) }
+
+    /// Where the agent is actually working. `foreground.cwd` follows a `cd`
+    /// inside the terminal; `cwd` is only where it started.
     public var workingDirectory: String? {
         [foregroundCwd, cwd].compactMap { $0 }.first { !$0.isEmpty }
     }
@@ -38,406 +43,185 @@ public struct HerdrAgent: Equatable, Sendable {
         return (directory as NSString).lastPathComponent
     }
 
-    init(json: [String: Any]) {
-        terminalID = json["terminal_id"] as? String
-        paneID = json["pane_id"] as? String
-        tabID = json["tab_id"] as? String
-        workspaceID = json["workspace_id"] as? String
-        agent = json["agent"] as? String ?? "agent"
-        status = json["agent_status"] as? String ?? "unknown"
-        cwd = json["cwd"] as? String
-        foregroundCwd = json["foreground_cwd"] as? String
-        focused = json["focused"] as? Bool ?? false
-    }
-
-    /// For tests.
     public init(
-        agent: String = "claude",
+        agent: String = "claude-code",
         status: String,
+        address: String = "t1",
+        createdMs: Int64? = 1,
         paneID: String? = nil,
-        tabID: String? = nil,
-        workspaceID: String? = nil,
-        terminalID: String? = nil,
         cwd: String? = nil,
         foregroundCwd: String? = nil,
         focused: Bool = false
     ) {
         self.agent = agent
         self.status = status
+        self.address = address
+        self.createdMs = createdMs
         self.paneID = paneID
-        self.tabID = tabID
-        self.workspaceID = workspaceID
-        self.terminalID = terminalID
         self.cwd = cwd
         self.foregroundCwd = foregroundCwd
-        self.focused = focused
-    }
-
-}
-
-public struct HerdrTab: Equatable, Sendable {
-    public var tabID: String
-    public var workspaceID: String
-    /// Display position within the workspace, which is the order tabs cycle in.
-    public var number: Int
-    public var focused: Bool
-
-    init(json: [String: Any]) {
-        tabID = json["tab_id"] as? String ?? ""
-        workspaceID = json["workspace_id"] as? String ?? ""
-        number = json["number"] as? Int ?? 0
-        focused = json["focused"] as? Bool ?? false
-    }
-
-    /// For tests.
-    public init(tabID: String, workspaceID: String = "ws", number: Int, focused: Bool = false) {
-        self.tabID = tabID
-        self.workspaceID = workspaceID
-        self.number = number
         self.focused = focused
     }
 }
 
 public enum HerdrError: LocalizedError {
-    case cannotConnect(String, String)
     case timeout(String)
     case api(String)
-    case closed(String)
     case badResponse(String)
 
     public var errorDescription: String? {
         switch self {
-        case .cannotConnect(let path, let reason):
-            return "Cannot reach the Herdr server at \(path): \(reason)"
         case .timeout(let method): return "Timed out waiting for \(method)."
         case .api(let message): return message
-        case .closed(let method): return "Connection closed before \(method) responded."
         case .badResponse(let detail): return "Bad response: \(detail)"
         }
     }
 }
 
+/// herdr-core owns terminals, status, and input on every connected machine;
+/// the Herdr app owns what is shown. Core requests go through `herdr-core
+/// connect` (JSON-RPC on stdin/stdout), app requests through `herdr-app`.
+/// Actions re-read the target's occupant first: a guard, not an atomic
+/// compare-and-act.
 public enum HerdrClient {
+    private static let environment = ProcessInfo.processInfo.environment
+    private static let home = NSHomeDirectory() as NSString
+    static let coreBinary = environment["WL_HERDR_CORE_BINARY"].flatMap { $0.isEmpty ? nil : $0 }
+        ?? home.appendingPathComponent(".local/bin/herdr-core")
+    static let appBinary = environment["WL_HERDR_APP_BINARY"].flatMap { $0.isEmpty ? nil : $0 }
+        ?? home.appendingPathComponent(".local/bin/herdr-app")
+    private static let snapshots = HerdrSnapshotLoader()
 
-    public static func socketPath() -> String {
-        let env = ProcessInfo.processInfo.environment
-        if let explicit = env["HERDR_SOCKET_PATH"], !explicit.isEmpty { return explicit }
-        let base = env["XDG_CONFIG_HOME"].flatMap { $0.isEmpty ? nil : $0 }
-            ?? (NSHomeDirectory() as NSString).appendingPathComponent(".config")
-        return (base as NSString).appendingPathComponent("herdr/herdr.sock")
+    public static func snapshot() async throws -> HerdrSnapshot {
+        try await snapshots.load()
     }
 
-    // MARK: - Requests
-
-    public static func request(
-        _ method: String,
-        params: [String: Any] = [:],
-        timeout: TimeInterval = 5
-    ) async throws -> [String: Any] {
-        try await withCheckedThrowingContinuation { continuation in
-            let conn = SocketConnection(path: socketPath())
-            var finished = false
-            let finish: (Result<[String: Any], Error>) -> Void = { result in
-                guard !finished else { return }
-                finished = true
-                conn.close()
-                continuation.resume(with: result)
-            }
-
-            conn.onLine = { line in
-                guard let data = line.data(using: .utf8),
-                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-                else {
-                    finish(.failure(HerdrError.badResponse(line)))
-                    return
-                }
-                if let error = object["error"] as? [String: Any] {
-                    finish(.failure(HerdrError.api(error["message"] as? String ?? "api error")))
-                } else {
-                    finish(.success(object["result"] as? [String: Any] ?? [:]))
-                }
-            }
-            conn.onClosed = { error in
-                finish(.failure(error ?? HerdrError.closed(method)))
-            }
-
-            do {
-                try conn.open()
-            } catch {
-                finish(.failure(error))
-                return
-            }
-
-            let envelope: [String: Any] = ["id": nextID(), "method": method, "params": params]
-            guard let payload = try? JSONSerialization.data(withJSONObject: envelope) else {
-                finish(.failure(HerdrError.badResponse("could not encode params")))
-                return
-            }
-            conn.write(payload + Data("\n".utf8))
-
-            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
-                finish(.failure(HerdrError.timeout(method)))
-            }
-        }
-    }
-
-    /// Agents in the server's own order — workspace, then tab, then pane —
-    /// which is exactly how Herdr's agent panel lists them in grouped mode.
-    /// Slot N is element N, so the pad reads like the sidebar. Do not re-sort:
-    /// an earlier version ordered by ID strings here, and IDs do not sort the
-    /// way the sidebar displays.
+    /// Herdr app order (space → tab → terminal → sub-agents), then agents the
+    /// app does not show, in core order.
     public static func listAgents() async throws -> [HerdrAgent] {
-        let result = try await request("agent.list")
-        let raw = result["agents"] as? [[String: Any]] ?? []
-        return raw.map(HerdrAgent.init(json:))
+        try await snapshot().agents
     }
 
-    /// The agent whose pane has focus in Herdr, if any. Fetched fresh rather
-    /// than read off the bridge's poll, since focus is exactly the thing that
-    /// changes between polls.
     public static func focusedAgent() async throws -> HerdrAgent? {
-        try await listAgents().first(where: \.focused)
+        try await snapshot().agents.first(where: \.focused)
     }
 
-    /// Focus an agent by its pane identity. Herdr 0.9.0's `agent.focus`
-    /// updates server selection but omits client-shell navigation propagation;
-    /// `pane.focus` updates both, including the containing workspace and tab.
-    public static func focusAgent(_ paneID: String) async throws {
-        try await focusAgent(paneID, send: { method, params in
-            try await request(method, params: params)
-        })
+    public static func focusAgent(_ target: HerdrAgentTarget) async throws {
+        try await verify(target)
+        try await appCommand("agent.focus", ["terminal": target.address])
     }
 
-    /// Injectable request boundary for wire-contract regression tests.
-    static func focusAgent(
-        _ paneID: String,
-        send: (String, [String: Any]) async throws -> [String: Any]
-    ) async throws {
-        guard !paneID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw HerdrError.api("The agent has no pane identity to focus.")
-        }
-        let result = try await send("pane.focus", ["pane_id": paneID])
-        guard let pane = result["pane"] as? [String: Any], pane["pane_id"] as? String == paneID else {
-            throw HerdrError.badResponse("pane.focus did not acknowledge the requested pane \(paneID).")
-        }
+    /// Named keys (`enter`, `esc`, `up`, `ctrl+alt+u`), encoded by the core
+    /// for the program's current keyboard mode.
+    public static func sendKeys(target: HerdrAgentTarget, keys: [String]) async throws {
+        try await verify(target)
+        _ = try await rpc("terminal.keys", ["terminal": target.address, "keys": keys])
     }
 
-    public static func listTabs(workspaceID: String? = nil) async throws -> [HerdrTab] {
-        var params: [String: Any] = [:]
-        if let workspaceID { params["workspace_id"] = workspaceID }
-        let result = try await request("tab.list", params: params)
-        let raw = result["tabs"] as? [[String: Any]] ?? []
-        return raw.map(HerdrTab.init(json:))
+    /// Types text without submitting it. herdr-core has no unsubmitted paste,
+    /// so this presses one key per character and refuses, before typing
+    /// anything, text that named keys cannot spell.
+    public static func typeText(target: HerdrAgentTarget, text: String) async throws {
+        let keys = try keyNames(for: text)
+        try await sendKeys(target: target, keys: keys)
     }
 
-    public static func focusTab(_ tabID: String) async throws {
-        _ = try await request("tab.focus", params: ["tab_id": tabID])
+    /// Pastes text and presses Enter. The core waits for a person's unsent
+    /// draft (up to its `draft_wait`, 60 s by default) and refuses a blocked
+    /// program rather than answering its dialog.
+    public static func submitText(target: HerdrAgentTarget, text: String) async throws {
+        try await verify(target)
+        _ = try await rpc("terminal.send", ["terminal": target.address, "text": text], timeout: 75)
     }
 
-    /// Injects key chords into a pane, crossterm-style names ("ctrl+alt+v",
-    /// "f13", "enter"). The pane's terminal encodes them as if typed.
-    public static func sendKeys(paneID: String, keys: [String]) async throws {
-        _ = try await request("pane.send_keys", params: ["pane_id": paneID, "keys": keys])
-    }
-
-    /// Types a string into a pane — bracketed-pasted when the pane supports
-    /// it, so multi-word text lands as one block and nothing auto-submits.
-    public static func sendText(paneID: String, text: String) async throws {
-        _ = try await request("pane.send_text", params: ["pane_id": paneID, "text": text])
-    }
-
-    /// Focuses the tab after the focused one in its workspace, wrapping at the
-    /// end. Tabs in other workspaces are left alone: cycling is a
-    /// within-window gesture, not a window switcher.
+    /// The Herdr app's shown space moves to its next tab.
     public static func cycleTabs() async throws {
-        guard let next = nextTab(in: try await listTabs()) else { return }
-        try await focusTab(next.tabID)
+        try await appCommand("tab.next", [:])
     }
 
-    /// The tab `cycleTabs` would focus, or nil when there is nothing to do —
-    /// no focused tab, or a workspace with a single tab.
-    public static func nextTab(in tabs: [HerdrTab]) -> HerdrTab? {
-        guard let focused = tabs.first(where: \.focused) else { return nil }
-        let siblings = tabs
-            .filter { $0.workspaceID == focused.workspaceID }
-            .sorted { $0.number < $1.number }
-        guard siblings.count > 1,
-              let index = siblings.firstIndex(of: focused)
-        else { return nil }
-        return siblings[(index + 1) % siblings.count]
-    }
+    // MARK: - Text as named keys
 
-    private static let counter = Counter()
-    private static func nextID() -> String { "wl_\(counter.next())" }
+    /// Characters herdr-core accepts as key names in the observed 0.1.20
+    /// build. Shifted punctuation (`?`, `!`, `:`) has no name and is refused.
+    private static let directKeys = Set(",-./;=[\\]`'")
 
-    private final class Counter: @unchecked Sendable {
-        private var value = 0
-        private let lock = NSLock()
-        func next() -> Int {
-            lock.lock(); defer { lock.unlock() }
-            value += 1
-            return value
-        }
-    }
-}
-
-// MARK: - Event streams
-
-/// One subscription, on its own connection. The first line is the
-/// acknowledgement; everything after it is a pushed event.
-public final class HerdrEventStream {
-    public var onReady: (() -> Void)?
-    public var onEvent: (([String: Any]) -> Void)?
-    public var onClosed: ((Error?) -> Void)?
-
-    private let subscriptions: [[String: Any]]
-    private let conn: SocketConnection
-    private var ready = false
-    private var stopped = false
-
-    public init(subscriptions: [[String: Any]]) {
-        self.subscriptions = subscriptions
-        self.conn = SocketConnection(path: HerdrClient.socketPath())
-    }
-
-    @discardableResult
-    public func start() -> HerdrEventStream {
-        conn.onLine = { [weak self] line in
-            guard let self, !self.stopped else { return }
-            guard let data = line.data(using: .utf8),
-                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else { return }
-            if !self.ready {
-                self.ready = true
-                DispatchQueue.main.async { self.onReady?() }
-                return
+    static func keyNames(for text: String) throws -> [String] {
+        try text.map { character -> String in
+            guard character.isASCII else { throw unspellable(character) }
+            if character == " " { return "space" }
+            if character.isLowercase || character.isNumber || directKeys.contains(character) {
+                return String(character)
             }
-            DispatchQueue.main.async { self.onEvent?(object) }
+            if character.isUppercase { return "shift+" + character.lowercased() }
+            throw unspellable(character)
         }
-        conn.onClosed = { [weak self] error in
-            guard let self, !self.stopped else { return }
-            DispatchQueue.main.async { self.onClosed?(error) }
-        }
+    }
 
+    private static func unspellable(_ character: Character) -> HerdrError {
+        .api("Herdr cannot type \"\(character)\" without submitting. Use letters, digits, spaces, and , - . / ; = [ \\ ] ` ' only.")
+    }
+
+    // MARK: - Transport
+
+    static func loadSnapshot() async throws -> HerdrSnapshot {
+        async let core = rpc("terminal.list", [:])
+        async let layout = appJSON(["ls"])
+        async let view = appJSON(["status"])
+        let terminals = try await core
+        let app: (layout: [String: Any], focusedPane: String?)?
+        let appError: String?
         do {
-            try conn.open()
+            app = (try await layout, (try await view)["focused_pane"] as? String)
+            appError = nil
         } catch {
-            DispatchQueue.main.async { [weak self] in self?.onClosed?(error) }
-            return self
+            app = nil
+            appError = "Herdr app: \(error.localizedDescription)"
         }
-
-        let envelope: [String: Any] = [
-            "id": "wl_sub",
-            "method": "events.subscribe",
-            "params": ["subscriptions": subscriptions],
-        ]
-        if let payload = try? JSONSerialization.data(withJSONObject: envelope) {
-            conn.write(payload + Data("\n".utf8))
-        }
-        return self
+        return try HerdrSnapshot(core: terminals, app: app?.layout, focusedPane: app?.focusedPane, appError: appError)
     }
 
-    public func stop() {
-        stopped = true
-        conn.close()
-    }
-
-    deinit { conn.close() }
-}
-
-// MARK: - Socket plumbing
-
-/// A blocking read loop on its own queue. Deliberately plain POSIX: the
-/// alternative is Network.framework, which adds ceremony for no benefit on a
-/// local Unix socket.
-final class SocketConnection: @unchecked Sendable {
-    var onLine: ((String) -> Void)?
-    var onClosed: ((Error?) -> Void)?
-
-    private let path: String
-    private var fd: Int32 = -1
-    private let queue = DispatchQueue(label: "cc.worklouder.herdr-socket")
-    private var buffer = Data()
-    private var closed = false
-    private let lock = NSLock()
-
-    init(path: String) { self.path = path }
-
-    func open() throws {
-        let handle = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard handle >= 0 else {
-            throw HerdrError.cannotConnect(path, String(cString: strerror(errno)))
-        }
-
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        let maxLength = MemoryLayout.size(ofValue: addr.sun_path)
-        guard path.utf8.count < maxLength else {
-            Darwin.close(handle)
-            throw HerdrError.cannotConnect(path, "socket path too long")
-        }
-        _ = withUnsafeMutablePointer(to: &addr.sun_path) { pathPtr in
-            path.withCString { source in
-                strncpy(UnsafeMutableRawPointer(pathPtr).assumingMemoryBound(to: CChar.self), source, maxLength - 1)
-            }
-        }
-
-        let size = socklen_t(MemoryLayout<sockaddr_un>.size)
-        let result = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(handle, $0, size) }
-        }
-        guard result == 0 else {
-            let reason = String(cString: strerror(errno))
-            Darwin.close(handle)
-            throw HerdrError.cannotConnect(path, reason)
-        }
-
-        fd = handle
-        queue.async { [weak self] in self?.readLoop() }
-    }
-
-    func write(_ data: Data) {
-        lock.lock(); defer { lock.unlock() }
-        guard fd >= 0 else { return }
-        data.withUnsafeBytes { raw in
-            var sent = 0
-            while sent < raw.count {
-                let n = Darwin.write(fd, raw.baseAddress!.advanced(by: sent), raw.count - sent)
-                if n <= 0 { break }
-                sent += n
-            }
+    /// The target's address still holds the same live occupant.
+    private static func verify(_ target: HerdrAgentTarget) async throws {
+        let terminal = try await rpc("terminal.get", ["terminal": target.address])
+        guard terminal["address"] as? String == target.address,
+              (terminal["created_ms"] as? NSNumber)?.int64Value == target.createdMs,
+              terminal["state"] as? String == "live" else {
+            throw HerdrError.api("That Herdr terminal has ended or been replaced.")
         }
     }
 
-    func close() {
-        lock.lock()
-        let handle = fd
-        fd = -1
-        closed = true
-        lock.unlock()
-        if handle >= 0 { Darwin.close(handle) }
+    static func rpc(_ method: String, _ params: [String: Any], timeout: TimeInterval = 20) async throws -> [String: Any] {
+        var request = try JSONSerialization.data(withJSONObject: [
+            "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
+        ])
+        request.append(0x0A)
+        let data = try await HerdrCommand.run(executable: coreBinary, arguments: ["connect"],
+                                              input: request, timeout: timeout)
+        let line = data.split(separator: 0x0A, maxSplits: 1).first ?? data[...]
+        guard let envelope = try JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else {
+            throw HerdrError.badResponse("herdr-core did not return a JSON-RPC envelope.")
+        }
+        if let error = envelope["error"] as? [String: Any] {
+            throw HerdrError.api(error["message"] as? String ?? "herdr-core \(method) failed.")
+        }
+        guard let result = envelope["result"] as? [String: Any] else {
+            throw HerdrError.badResponse("herdr-core \(method) has no result.")
+        }
+        return result
     }
 
-    private func readLoop() {
-        var chunk = [UInt8](repeating: 0, count: 8192)
-        while true {
-            lock.lock(); let handle = fd; lock.unlock()
-            guard handle >= 0 else { break }
-
-            let n = Darwin.read(handle, &chunk, chunk.count)
-            if n <= 0 { break }
-            buffer.append(contentsOf: chunk[0..<n])
-
-            while let index = buffer.firstIndex(of: UInt8(ascii: "\n")) {
-                let lineData = buffer.prefix(upTo: index)
-                buffer = buffer.suffix(from: buffer.index(after: index))
-                if let line = String(data: lineData, encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines), !line.isEmpty {
-                    onLine?(line)
-                }
-            }
+    private static func appJSON(_ arguments: [String]) async throws -> [String: Any] {
+        let data = try await HerdrCommand.run(executable: appBinary, arguments: arguments, timeout: 10)
+        guard let result = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw HerdrError.badResponse("herdr-app \(arguments.joined(separator: " ")) did not return JSON.")
         }
-        lock.lock(); let wasClosed = closed; lock.unlock()
-        if !wasClosed { onClosed?(nil) }
+        return result
+    }
+
+    /// Arguments go as one JSON object, so an address can never be read as a flag.
+    private static func appCommand(_ name: String, _ arguments: [String: String]) async throws {
+        let object = try JSONSerialization.data(withJSONObject: arguments)
+        let result = try await appJSON(["do", name, String(decoding: object, as: UTF8.self)])
+        if let error = result["error"] as? String { throw HerdrError.api(error) }
     }
 }

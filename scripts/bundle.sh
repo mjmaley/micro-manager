@@ -17,6 +17,16 @@
 # Set WL_SIGN_IDENTITY to choose the identity explicitly (CI does this);
 # otherwise the first Developer ID or Apple Development identity in the
 # keychain is used.
+#
+# Set WL_MACOS_SDK to an SDK directory to build against it instead of the
+# toolchain default, e.g. Command Line Tools 27.x, whose macOS 27 SDK needs
+# Xcode's SwiftUI macro plugin:
+#
+#   WL_MACOS_SDK=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk ./scripts/bundle.sh
+#
+# SwiftPM alone then records SDK 13.0 in the binary, which would give it
+# macOS 13 AppKit/SwiftUI compatibility behavior, so the SDK version is passed
+# to the linker explicitly and checked afterwards.
 
 set -euo pipefail
 
@@ -34,12 +44,29 @@ INSPECTOR="$APP/Contents/Library/$INSPECTOR_NAME.app"
 install=false
 [[ "${1:-}" == "--install" ]] && install=true
 
+BUILD_FLAGS=()
+SDK_VERSION=""
+if [[ -n "${WL_MACOS_SDK:-}" ]]; then
+    SDK_VERSION="$(plutil -extract Version raw "$WL_MACOS_SDK/SDKSettings.plist" 2>/dev/null)" || {
+        echo "WL_MACOS_SDK is not an SDK: $WL_MACOS_SDK" >&2; exit 1; }
+    # Must match platforms: [.macOS(.v13)] in Package.swift.
+    MIN_MACOS="13.0"
+    BUILD_FLAGS=(--sdk "$WL_MACOS_SDK"
+        -Xlinker -platform_version -Xlinker macos -Xlinker "$MIN_MACOS" -Xlinker "$SDK_VERSION")
+    echo "==> SDK $SDK_VERSION: $WL_MACOS_SDK"
+fi
+
 echo "==> building (release)"
-swift build -c release --product WLMicroManager
-swift build -c release --product WLInspector
+swift build -c release --product WLMicroManager ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"}
+swift build -c release --product WLInspector ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"}
 for product in WLMicroManager WLInspector; do
     [[ -f ".build/release/$product" ]] || {
         echo "build produced no binary at .build/release/$product" >&2; exit 1; }
+    if [[ -n "$SDK_VERSION" ]]; then
+        recorded="$(vtool -show-build ".build/release/$product" | awk '$1 == "sdk" { print $2; exit }')"
+        [[ "$recorded" == "$SDK_VERSION" ]] || {
+            echo "$product records SDK ${recorded:-none}, expected $SDK_VERSION" >&2; exit 1; }
+    fi
 done
 
 echo "==> assembling $APP"

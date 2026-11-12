@@ -22,10 +22,10 @@ final class AgentNotificationController: NSObject, ObservableObject, UNUserNotif
     private lazy var center = UNUserNotificationCenter.current()
     private weak var bridge: BridgeController?
     private var tracker = AgentNotificationTracker()
-    private var current: [AgentNotificationTarget: HerdrAgent] = [:]
+    private var current: [HerdrAgentTarget: HerdrAgent] = [:]
     private var lastTerminalActive: Bool?
     private var pending: [String: Task<Void, Never>] = [:]
-    private var queuedClick: AgentNotificationTarget?
+    private var queuedClick: HerdrAgentTarget?
     private var revision = 0
 
     /// Install before didFinishLaunching so clicking an alert can cold-launch
@@ -37,8 +37,8 @@ final class AgentNotificationController: NSObject, ObservableObject, UNUserNotif
 
     func configure(bridge: BridgeController) async {
         self.bridge = bridge
-        bridge.onAgentSnapshot = { [weak self] agents, identity in
-            self?.observe(agents, identity: identity)
+        bridge.onAgentSnapshot = { [weak self] agents in
+            self?.observe(agents)
         }
         bridge.onAgentObservationReset = { [weak self] in self?.reset() }
         if let target = queuedClick {
@@ -107,13 +107,12 @@ final class AgentNotificationController: NSObject, ObservableObject, UNUserNotif
         pending.removeAll()
     }
 
-    private func observe(_ agents: [HerdrAgent], identity: String) {
+    private func observe(_ agents: [HerdrAgent]) {
         guard enabled, isBundled else { return }
-        let socket = HerdrClient.socketPath()
         let terminalActive = BridgeController.terminalIsActive
-        var next: [AgentNotificationTarget: HerdrAgent] = [:]
+        var next: [HerdrAgentTarget: HerdrAgent] = [:]
         for agent in agents {
-            if let target = AgentNotificationTarget(agent: agent, socketPath: socket, socketIdentity: identity) {
+            if let target = agent.focusTarget {
                 next[target] = agent
             }
         }
@@ -136,13 +135,13 @@ final class AgentNotificationController: NSObject, ObservableObject, UNUserNotif
             center.removeDeliveredNotifications(withIdentifiers: ids)
         }
         current = next
-        for event in tracker.consume(agents, socketPath: socket, socketIdentity: identity, terminalActive: terminalActive) {
+        for event in tracker.consume(agents, terminalActive: terminalActive) {
             post(target: event.target, agent: event.agent, kind: event.kind)
         }
     }
 
     private func post(
-        target: AgentNotificationTarget, agent: HerdrAgent,
+        target: HerdrAgentTarget, agent: HerdrAgent,
         kind: AgentNotificationEvent.Kind, test: Bool = false
     ) {
         let id = (test ? "test-" : "") + target.identifier
@@ -161,7 +160,9 @@ final class AgentNotificationController: NSObject, ObservableObject, UNUserNotif
                 let content = UNMutableNotificationContent()
                 let label = String(agent.agent.prefix(60))
                 content.title = test ? "Herdr pane click test" : "\(label) \(kind == .attention ? "needs attention" : "finished")"
-                content.subtitle = String(agent.shortName.prefix(100)) + " · pane " + String(target.paneID.suffix(8))
+                content.subtitle = String(agent.shortName.prefix(100)) + " · "
+                    + String(agent.machineLabel.prefix(60))
+                    + " · " + String(target.address.suffix(70))
                 content.body = test
                     ? "Click to focus this agent in Herdr and return to your terminal."
                     : (kind == .attention ? "Waiting for your input. Click to open this pane." : "Ready to review. Click to open this pane.")
@@ -184,27 +185,21 @@ final class AgentNotificationController: NSObject, ObservableObject, UNUserNotif
 
     /// Prefer another pane so a click visibly demonstrates target selection.
     /// A per-agent context menu can supply an exact target instead.
-    func sendTest(paneID: String? = nil) async {
+    func sendTest(target requestedTarget: HerdrAgentTarget? = nil) async {
         guard enabled else { return }
         guard isBundled else { await refreshPermission(); return }
         do {
-            let socket = HerdrClient.socketPath()
-            guard let identity = AgentNotificationTarget.socketIdentity(at: socket) else {
-                throw HerdrError.api("Herdr's socket is not available.")
-            }
             let agents = try await HerdrClient.listAgents()
-            let agent = paneID.flatMap { id in agents.first { $0.paneID == id } }
-                ?? (paneID == nil ? agents.first { !$0.focused } ?? agents.first : nil)
-            guard let agent,
-                  let target = AgentNotificationTarget(agent: agent, socketPath: socket, socketIdentity: identity),
-                  identity == AgentNotificationTarget.socketIdentity(at: socket) else {
+            let agent = requestedTarget.flatMap { target in agents.first { $0.focusTarget == target } }
+                ?? (requestedTarget == nil ? agents.first { !$0.focused } ?? agents.first : nil)
+            guard let agent, let target = agent.focusTarget else {
                 throw HerdrError.api("No matching Herdr agent is available for a test.")
             }
             post(target: target, agent: agent, kind: .attention, test: true)
         } catch { status = error.localizedDescription }
     }
 
-    private func focus(_ target: AgentNotificationTarget) async {
+    private func focus(_ target: HerdrAgentTarget) async {
         guard let bridge else { queuedClick = target; return }
         do {
             try await bridge.focusNotificationTarget(target)
@@ -233,7 +228,7 @@ final class AgentNotificationController: NSObject, ObservableObject, UNUserNotif
     ) {
         guard response.actionIdentifier == UNNotificationDefaultActionIdentifier,
               let data = response.notification.request.content.userInfo["herdrTarget"] as? Data,
-              let target = try? JSONDecoder().decode(AgentNotificationTarget.self, from: data) else {
+              let target = try? JSONDecoder().decode(HerdrAgentTarget.self, from: data) else {
             completionHandler()
             return
         }

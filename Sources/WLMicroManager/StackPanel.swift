@@ -92,6 +92,13 @@ final class StackPanelController {
                 body: PanelHTML.note("Nothing has focus in Herdr right now.")
             )
         }
+        guard agent.isLocalMachine else {
+            return Payload(
+                title: agent.shortName,
+                subtitle: agent.machineLabel,
+                body: PanelHTML.note("The Stack panel supports local checkouts only. Remote filesystem and GitButler commands are not supported.")
+            )
+        }
         guard let directory = agent.workingDirectory else {
             return Payload(
                 title: agent.shortName,

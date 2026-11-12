@@ -2,10 +2,13 @@
 
 > This is [mjmaley's fork](https://github.com/mjmaley/micro-manager) of
 > [schacon/micro-manager](https://github.com/schacon/micro-manager). Custom
-> Codex Micro, Pi, and notification work is on `layer-aware-herdr`. The upstream
-> download links below do not include these changes. **Before building or resuming
-> work, read the [current handoff](docs/HANDOFF.md): this branch includes a deferred
-> latency experiment that is not in the installed, hardware-validated build.**
+> Codex Micro, Pi, notification, and herdr-core work is on
+> `layer-aware-herdr`. The upstream download links below do not include these
+> changes. **The herdr-core source cutover is uncommitted and uninstalled.** The
+> installed app remains the September 9 synchronous build, which only speaks to
+> the retired Herdr 0.9 server. Before building or resuming work, read the
+> [current handoff](docs/HANDOFF.md): the primary tree also retains deferred
+> HID/lighting experiments that are not hardware-cleared for installation.
 
 A macOS menu-bar app that lights each running [Herdr](https://herdr.dev) agent
 on its own key of a Work Louder **Codex Micro** or
@@ -13,11 +16,13 @@ on its own key of a Work Louder **Codex Micro** or
 when you press the key. On Codex Micro, native Codex remains on Layer 1 while
 Herdr gets the complete controls and live lighting on Layer 2.
 
-The bridge needs no Node process or additional daemon. It reads Herdr's socket
-and drives the pad over raw HID. Reliable agent status still depends on Herdr's
-agent-specific integrations; for example, OMP needs `herdr integration install omp`
-and must load that extension in the agent process. See the
-[OMP status investigation](docs/omp-status-investigation.md).
+The bridge needs no Node process or additional daemon. It polls
+[herdr-core](https://herdr.dev) (`herdr-core connect`, JSON-RPC) for terminals
+and their statuses on this computer and every connected machine, asks the
+Herdr desktop app (`herdr-app`) where they are shown and which pane has focus,
+and drives the pad over raw HID. Status is whatever each program reports over
+OSC 7501; a program that never reports is a terminal, not an agent. The Herdr
+0.9 TUI hooks (`herdr integration install …`) do not run under herdr-core.
 
 **[Download the latest release](https://github.com/schacon/micro-manager/releases/latest/download/MicroManager.zip)**
 · [website](https://schacon.github.io/micro-manager/)
@@ -27,14 +32,25 @@ and must load that extension in the agent process. See the
 
 ## Install
 
-Download, unzip, drag `MicroManager.app` to Applications, and launch it. macOS
-will ask for **Input Monitoring** — grant it, then toggle the manager off and on
-from the menu-bar panel so it reconnects with the permission.
+For the **upstream release**, download, unzip, drag `MicroManager.app` to
+Applications, and launch it. macOS will ask for **Input Monitoring** — grant it,
+then toggle the manager off and on from the menu-bar panel so it reconnects with
+the permission. This does not install the fork behavior described below.
 
-Or build it yourself:
+**Fork builders:** use the [handoff's synchronous source reconstruction](docs/HANDOFF.md#reconstruct-the-synchronous-source-profile-safely)
+in a separate stage; do not apply exclusions to the experimental primary tree.
+Command Line Tools 27.0 lack the SwiftUI macro plugin the macOS 27 SDK needs for
+`@State`; fork builds stay on the installed 26.5 SDK, the same SDK as the
+validated September 9 build:
+`WL_MACOS_SDK=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk ./scripts/bundle.sh`.
+The script also tells the linker that SDK version and refuses a binary that
+records any other (SwiftPM alone records 13.0). Then validate on physical hardware before any separately
+authorized packaging or installation. No existing Herdr terminal needs
+restarting for this cutover.
+
+Pi Guardrails setup is independent of building or installing MicroManager:
 
 ```bash
-./scripts/bundle.sh --install     # build, sign, install to /Applications, launch
 pi install npm:@aliou/pi-guardrails
 ```
 
@@ -42,8 +58,10 @@ Run `/guardrails:onboarding` once to choose the safety defaults. Run `/reload`
 in existing Pi sessions after installing Guardrails; new sessions discover it
 automatically.
 
-You will also need a supported pad and a running Herdr server with agents in
-it. Quit Work Louder's Input app while you use this. Creator Micro 2 remains a
+You will also need a supported pad, herdr-core and the Herdr desktop app
+(installed to `~/.local/bin` by Herdr's installer; see [Herdr setup](#herdr-setup)),
+and agents that report their status.
+Quit Work Louder's Input app while you use this. Creator Micro 2 remains a
 single-owner integration, so quit Codex there too. Codex Micro is layer-aware:
 Codex desktop may stay open and keeps Layer 1; switch to Layer 2 for Herdr.
 
@@ -77,48 +95,37 @@ reported app identity, HID errors, and successful recovery:
 running — green all idle, amber something working, red something needs you —
 and a badge when the pad is missing or permission is denied.
 
-**The six agent keys** show one bank of agents at a time, in Herdr's
-workspace → tab → pane traversal order (`agent.list`). This matches grouped
-sidebar order, not priority/custom-view sorting. With more than six agents,
-joystick left/right pages the banks when no model picker is open. Colours are:
+**The six agent keys** show one bank of agents at a time, in the order the
+Herdr app shows them: space → tab → terminal, a sub-agent after its parent, then
+any agent the app does not show, in herdr-core's order. Rows include the
+machine. With more than six agents, joystick left/right pages the banks when no
+model picker is open. Colours are:
 
 - **Red, breathing:** blocked / needs attention.
+- **Red:** the program reported an error.
 - **Amber:** working.
-- **Green:** finished, waiting to be viewed—or still being viewed.
-- **White:** idle or an acknowledged completion.
-- **Grey-blue:** unknown, not a claim that work finished.
+- **Green:** finished and not yet seen in the Herdr app.
+- **White:** idle, or a finished turn you have seen.
+- **Grey-blue:** a status word MicroManager does not know.
 
-A completion stays green until you have viewed that pane **with the terminal
-app in the foreground**, then left it. If the active pane finishes, it stays
-green for as long as you keep viewing it—there is no timer. Switching panes or
-switching to another app acknowledges a viewed result and turns its key white.
-A selected pane behind your browser does not count as viewed, and a new work
-cycle resets the acknowledgement. This is a focus-based approximation of
-"seen", not detection of whether you actually read the text.
+"Seen" is the Herdr app's own record (`herdr.seen`, the last turn shown to you),
+so a key turns white exactly when the app's lists stop calling that agent done.
+MicroManager keeps no read state of its own.
 
-MicroManager tracks observed `working`/`blocked` → `idle`/`done` transitions, as
-Pi may report `idle` even for an unread result. Herdr's raw agent status and
-notification rules are unchanged. Tracking is in memory: startup/newly detected
-idle agents start white, while explicit `done` starts green; it cannot infer
-historical unread results from `idle` alone. Server replacement and closed
-panes discard their old history. Pane/tab/workspace focus events and foreground
-app changes trigger refreshes, backed by the normal status poll.
+The **underglow follows the agent in the Herdr app's focused pane**, including
+one outside the visible six-key bank. It keeps following that pane while another
+app is in front; if the focused pane is not an agent, the ring goes dark. The
+menu-bar icon summarizes the worst state across all agents.
 
-The **underglow follows the selected Herdr agent**, including one outside the
-visible six-key bank. It keeps following that selection while another app is in
-front; if no agent is selected, the ring goes dark. The menu-bar icon still
-summarizes the worst raw state across all agents.
-
-Pressing an agent key focuses that agent in Herdr **and brings the terminal
-forward** — Herdr selects the pane but leaves the window where it was, so an
-agent key pressed from a browser used to move a cursor you could not see. Set
-`WL_TERMINAL_BUNDLE_ID` if your panes do not live in Ghostty.
-
-Navigation uses `pane.focus` with the agent's `pane_id`. In Herdr 0.9.0,
-`agent.focus` changes server selection without updating the displayed client
-session; `pane.focus` also switches the visible workspace/tab. Agent keys and
-notification clicks use the same corrected path. No synthetic keystrokes or
-Herdr restart are needed.
+Pressing an agent key runs the app's `agent.focus` for that terminal and brings
+the Herdr app forward (set `WL_TERMINAL_BUNDLE_ID` if your panes live somewhere
+else). Every target is the terminal's address (`t7`, or `rohan/t7` on another
+machine) plus its start time; before acting, MicroManager re-reads that address
+and refuses if a different terminal now holds it. This is read-before-action,
+not an atomic compare-and-act. Keys go through herdr-core `terminal.keys`;
+slash commands through `terminal.send`, which waits for a draft you are typing
+and refuses a program that is asking a question. Tab cycling is the app's
+`tab.next` in the shown space. No synthetic macOS keystrokes are used.
 
 **Row 3** follows the printed Codex keycaps and controls Pi:
 
@@ -131,7 +138,7 @@ Herdr restart are needed.
 
 **Row 4** is the wide key — it sends Command+/, which starts and stops
 OpenWhispr with this machine's tap-activation setup — and the **Submit** key,
-which sends Enter to the focused Herdr pane.
+which sends Enter to the agent in the Herdr app's focused pane.
 
 **The dial** tunes reasoning effort. In Pi it opens `/thinking`, rotation moves
 through the choices, and pressing the dial confirms. **The joystick** switches
@@ -212,8 +219,8 @@ swift test
 
 Install [`@aliou/pi-guardrails`](https://github.com/aliou/pi-guardrails) for
 file protection, outside-workspace path checks, and dangerous-command prompts.
-Its Herdr adapter marks a waiting Pi pane as blocked, so the corresponding agent
-key breathes red. At a dangerous-command prompt, APPR allows once, FAST allows
+Under herdr-core the key breathes red only if Pi reports its waiting prompt as
+`blocked` over OSC 7501; that is not yet verified for Pi. At a dangerous-command prompt, APPR allows once, FAST allows
 the exact command for the session, and REJ denies. At a path-access prompt,
 APPR chooses the highlighted grant (initially allow once) and REJ denies; FAST
 is reserved for dangerous-command session grants. Non-interactive operations
@@ -227,37 +234,38 @@ that agent. It also carries the on/off switch, an "Open at login" toggle, a
 warning when another app is fighting for the device, and the **Inspector**
 button.
 
+**Stack and Land are local-only.** These filesystem/GitButler panels reject a
+Remote agent's working directory, even if the same path exists locally. They do
+not silently operate on a local same-path checkout.
+
 **Off** clears the lights and stops driving, but deliberately leaves the device
 keymap alone: rebinding is a flash write, and the keys light instantly on the
 way back in if the bindings are still there.
 
 ## Clickable agent notifications
 
-The installed app can send native macOS notifications when a Herdr agent needs
+MicroManager can send native macOS notifications when a Herdr agent needs
 input or finishes work. Enable **Agent notifications** in the menu and allow
-**Micro Manager** in System Settings → Notifications. Click an alert to focus
-its exact Herdr pane, bring Ghostty forward, and select that agent's pad bank.
-This uses Herdr's socket API directly, not AppleScript or `terminal-notifier`.
+**Micro Manager** in System Settings → Notifications. Clicking an alert focuses
+that agent in the Herdr app, brings the app forward, and selects the agent's pad
+bank; no AppleScript or `terminal-notifier`.
 
 - The bridge must be **On**, but a connected pad is not required.
 - Initial discovery, reconnect, and wake establish a silent baseline. Repeated
-  polls do not repeat an alert; the focused pane is silent while Ghostty is active.
-- Destinations include the configured socket's incarnation, pane ID, and terminal
-  ID. A closed/replaced pane or restarted server produces an explanatory error
-  rather than focusing whichever agent later occupies the same slot.
+  polls do not repeat an alert; the agent in the focused pane is silent while
+  the Herdr app is active.
+- Destinations are a terminal address plus its start time. An ended or replaced
+  terminal, or a machine renamed since, produces an explanatory error rather
+  than focusing a different terminal.
 - **Test notification (5s)** gives you time to switch apps before delivery. It
-  prefers a background agent. Right-click an agent row to test that exact pane.
-- Notifications are silent; Herdr can continue providing its existing sounds.
-- Once permission and clicks are verified, avoid duplicate popups by backing up
-  `~/.config/herdr/config.toml`, setting `[ui.toast] delivery = "off"`, and running
-  `herdr server reload-config`. Micro Manager does not rewrite Herdr's config.
-  Restore the previous delivery setting if you stop using Micro Manager alerts.
+  prefers a background agent. Right-click an agent row to test that exact agent.
+- Notifications are silent. The Herdr app has its own alerts; turn one of the
+  two off in its settings or here if you see both.
 
-Only the Herdr socket configured for this Micro Manager process is monitored
-(default `~/.config/herdr/herdr.sock`; override with `HERDR_SOCKET_PATH`). This
-is not discovery of every named Herdr server. Ghostty activation is app-level:
-when multiple Ghostty windows exist, selecting the correct OS window is not
-implemented. Native notifications require the app bundle; `swift run` skips
+Agents on a machine that is not connected are absent until it reconnects; the
+menu shows that machine's state. Without a running Herdr app window the keys
+still light in herdr-core's order, but nothing is focused and agent keys report
+the app error. Native notifications require the app bundle; `swift run` skips
 notification delivery while retaining the other controls.
 
 ## The Inspector
@@ -309,8 +317,8 @@ Manager only — the Inspector is a separate process and still needs hardware.
 
 ## Configuration
 
-Everything works without a config file. To rebind the macro keys or change what
-the dial and joystick offer, drop a `config.json` into
+Macro configuration needs no config file by default. To rebind the macro keys
+or change what the dial and joystick offer, drop a `config.json` into
 `~/.config/micromanager/`:
 
 ```json
@@ -324,8 +332,12 @@ the dial and joystick offer, drop a `config.json` into
 }
 ```
 
-A bound string is injected into the focused agent's prompt, unsubmitted — you
-still read it and press enter. `"10+11"` addresses the wide key as one; `"10"`
+A bound string is typed into the agent in the Herdr app's focused pane,
+unsubmitted — you still read it and press Enter. herdr-core has no unsubmitted
+paste, so it is typed as named keys: letters, digits, spaces, and
+`` , - . / ; = [ \ ] ` ' ``. Text with any other character (`?`, `!`, `:`,
+newlines, non-ASCII) is refused before anything is typed. `"10+11"`
+addresses the wide key as one; `"10"`
 and `"11"` address its halves. Keys the file does not mention keep their
 defaults. Key 12 submits by default; assigning text to `"12"` overrides that.
 Binding the wide key to text replaces its OpenWhispr shortcut.
@@ -335,11 +347,35 @@ order — the joystick steers that menu rather than owning it, so there is nothi
 to read it from. Agent-bank paging uses only the joystick's otherwise-idle
 horizontal directions and does not change model-picker behavior.
 
+### Herdr setup
+
+MicroManager uses Herdr's desktop-app generation: herdr-core (`hc`) and the
+Herdr app, both installed to `~/.local/bin` by
+`curl -fsSL https://releases.herdr.dev/app/install.sh | sh` or the DMG. Add
+other machines in the app or with `hc machine add`; their agents appear without
+further setup. Pick a machine's name when adding it and keep it: a terminal on
+it is addressed as `name/t7`, so renaming the machine ends existing pad targets
+and alerts.
+
+Verified against herdr-core 0.1.20 and Herdr app 0.1.15. Read-only checks:
+
+```bash
+hc ls                 # terminals here and on connected machines, with status
+hc machine ls         # machines and whether they are connected
+herdr-app status      # the focused pane
+```
+
+Set these variables in the environment of the MicroManager process you
+deliberately launch; a Finder-launched app does not inherit terminal exports.
+
 | variable | what it overrides |
 |---|---|
-| `WL_TERMINAL_BUNDLE_ID` | the terminal to raise (default Ghostty) |
-| `HERDR_SOCKET_PATH` | the Herdr socket |
+| `WL_TERMINAL_BUNDLE_ID` | the app to raise (default `dev.herdr.app`) |
+| `WL_HERDR_CORE_BINARY` | absolute herdr-core path (default `~/.local/bin/herdr-core`) |
+| `WL_HERDR_APP_BINARY` | absolute herdr-app path (default `~/.local/bin/herdr-app`) |
+| `HC_SESSION`, `HERDR_APP_HOME` | passed through: which herdr-core session and app window to use |
 | `WL_SIGN_IDENTITY` | the signing identity `bundle.sh` uses |
+| `WL_MACOS_SDK` | SDK directory `bundle.sh` builds against (fork: the CLT `MacOSX26.5.sdk`) |
 | `WL_HERDR_LAYER` | override the Herdr layer number (Codex Micro defaults to 2; Creator Micro 2 to 1) |
 
 ## Why it must be bundled and signed
@@ -353,10 +389,11 @@ not silently leave the permission attached to an obsolete binary hash. It also
 sets `LSUIElement` so there is no Dock icon, and gives `SMAppService` a bundle
 it will actually register as a login item.
 
-Every push to main republishes the **`latest`** release, so the download link
-above always points at the current build; tagging `v*` cuts a permanent
-versioned release alongside it. Both go through
-[the release workflow](.github/workflows/release.yml).
+The upstream release workflow republishes **`latest`** on pushes to main and
+cuts permanent versioned releases for `v*` tags. The download link above targets
+that upstream repository, not this uninstalled fork source. See
+[the release workflow](.github/workflows/release.yml); do not push main or create
+release tags merely to checkpoint experimental work.
 
 That workflow signs with a Developer ID and notarizes when the repository has
 the secrets for it — the file lists them — and falls back to an ad-hoc
@@ -404,17 +441,26 @@ Codex may also need restarting after sleep if its own HID handle becomes stale.
 
 ## Development
 
+These are developer commands, not an installation recipe. With Command Line Tools
+27.x, pass `--sdk` for the 26.5 SDK to `swift build` (see [Install](#install));
+full XCTest requires a matching complete Xcode toolchain. WLKit and the targeted
+standalone suites can be used independently. The herdr-core cutover passed 92
+targeted primary-tree and 80 synchronous-stage tests plus live read-only and
+isolated-session action checks; it did not validate an installed app, physical
+pad, or Windows. Consult the [handoff](docs/HANDOFF.md) before staging or packaging.
+
 ```bash
-swift build            # both apps and the shared library
-swift test --skip Live  # non-live suite; full Xcode required
+swift build            # both apps/library; with CLT 27.x add --sdk …/MacOSX26.5.sdk
+swift test --skip Live  # non-live suite; matching full Xcode required
 ./scripts/test-swift-suite.sh LayerLightingTests  # also works with recent CLT
-./scripts/test-swift-suite.sh AgentLightingTests
 ./scripts/test-swift-suite.sh HerdrFocusTests
+./scripts/test-swift-suite.sh HerdrMachineTests
+./scripts/test-swift-suite.sh AgentNotificationTests
 ./scripts/test-swift-suite.sh SecureInputTests
 ./scripts/test-swift-suite.sh InputResponsivenessTests
 ./scripts/test-dictation-media.sh
 swift run WLInspector  # the debug UI
-./scripts/bundle.sh    # assemble build/MicroManager.app, unsigned install
+WL_MACOS_SDK=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk ./scripts/bundle.sh  # packaging only after hardware validation; no --install
 ```
 
 | | |
